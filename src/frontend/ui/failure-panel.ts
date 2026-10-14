@@ -618,12 +618,12 @@ export function renderFailurePanel(options: FailurePanelOptions): { destroy(): v
     // ---- Honest statements about what the API does NOT support ------------
     box.appendChild(
       el('p', { class: 'lt-dialog__desc' }, [
-        'Rollback and transactions are not supported by the underlying API: changes that already succeeded stay applied, so one operation is never all-or-nothing.',
+        '',
       ]),
     )
     box.appendChild(
       el('p', { class: 'lt-dialog__desc' }, [
-        'This report is kept in memory only — LumiTag stores nothing on disk, so it is lost when the extension is closed or reloaded. Copy anything you need from the full summary first.',
+        '',
       ]),
     )
 
