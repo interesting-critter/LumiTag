@@ -169,11 +169,23 @@ export function renderShell(options: ShellOptions): { destroy(): void } {
     // shell owns the actual detach/rebuild and can reliably restore focus after
     // the new section is attached.
     const active = root.ownerDocument.activeElement
-    const activeSearch = active instanceof HTMLInputElement && (
-      (view.section === 'tags' && active.matches('input.lt-search')) ||
-      (view.section === 'characters' && active.matches('input[data-lt-search="characters"]'))
-    ) ? {
-      selector: view.section === 'tags' ? 'input.lt-search' : 'input[data-lt-search="characters"]',
+    // Count-filter inputs are rebuilt along with the section just like the two
+    // primary search boxes. Capture them here too: this runs before clear(root),
+    // and restoring from the shell after renderSection has attached the new DOM
+    // is more reliable than section-level restoration during its own render.
+    const activeSelector = active instanceof HTMLInputElement ? (
+      view.section === 'tags' && active.matches('input.lt-search')
+        ? 'input.lt-search'
+        : view.section === 'characters' && active.matches('input[data-lt-search="characters"]')
+          ? 'input[data-lt-search="characters"]'
+          : view.section === 'tags' && active.matches('.lt-toolbar__count-field input')
+            ? '.lt-toolbar__count-field input'
+            : view.section === 'characters' && active.matches('.lt-toolbar__count-field input')
+              ? '.lt-toolbar__count-field input'
+              : null
+    ) : null
+    const activeSearch = active instanceof HTMLInputElement && activeSelector ? {
+      selector: activeSelector,
       start: active.selectionStart ?? active.value.length,
       end: active.selectionEnd ?? active.value.length,
       direction: active.selectionDirection ?? 'none',
