@@ -77,6 +77,8 @@ import {
 
 /** Hard cap on eagerly rendered characters in any one sub-list. */
 let tagCountTimer: ReturnType<typeof setTimeout> | null = null
+let countFilterFocusIntent = false
+let countFilterCaret = 0
 
 const CHARACTER_LIMIT = 200
 
@@ -355,7 +357,12 @@ export function renderTagsSection(options: {
     }))
     const countInput = countField.querySelector('input') as HTMLInputElement | null
     if (countInput) {
+      on(countInput, 'focus', () => { countFilterFocusIntent = true })
+      on(countInput, 'blur', () => { if (countInput.isConnected) countFilterFocusIntent = false })
+      on(countInput, 'keyup', () => { countFilterCaret = countInput.selectionStart ?? countInput.value.length })
+      on(countInput, 'click', () => { countFilterCaret = countInput.selectionStart ?? countInput.value.length })
       on(countInput, 'input', () => {
+        countFilterCaret = countInput.selectionStart ?? countInput.value.length
         const value = countInput.value
         if (tagCountTimer) clearTimeout(tagCountTimer)
         tagCountTimer = setTimeout(() => store.actions.setTagCountFilter(value), SEARCH_DEBOUNCE_MS)
@@ -416,6 +423,14 @@ export function renderTagsSection(options: {
    * render body that recorded the intent, which has already returned.
    */
   const restoreSearchFocus = (root: HTMLElement): void => {
+    if (countFilterFocusIntent) {
+      const countInput = root.querySelector('.lt-toolbar__count-field input')
+      if (countInput instanceof HTMLInputElement) {
+        countInput.focus()
+        try { countInput.setSelectionRange(countFilterCaret, countFilterCaret) } catch { /* text input caret restoration is best-effort */ }
+        return
+      }
+    }
     if (!searchFocusIntent) return
     const input = root.querySelector('input.lt-search')
     if (!(input instanceof HTMLInputElement)) return

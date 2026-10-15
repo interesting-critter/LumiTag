@@ -2175,7 +2175,7 @@ export const LUMITAG_CSS = `
   max-width: 180px;
   min-width: 100px;
 }
-.lt-toolbar__count-field .lt-input { width: 100%; min-width: 0; box-sizing: border-box; }
+.lt-toolbar__count-field .lt-input { width: 100%; min-width: 0; box-sizing: border-box; padding: 6px 12px; }
 .lt-toolbar__filter-field {
   flex: 0 1 190px;
   max-width: 220px;

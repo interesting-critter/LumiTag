@@ -100,6 +100,8 @@ import {
  * every existing tag is reachable by paging rather than only by searching.
  */
 let characterCountTimer: ReturnType<typeof setTimeout> | null = null
+let characterCountFocusIntent = false
+let characterCountCaret = 0
 
 const TAG_OPTION_LIMIT = 200
 
@@ -441,6 +443,14 @@ export function renderCharactersSection(options: {
    * cleared, so the intent is honoured by the frame that does build it.
    */
   const restoreSearchIntents = (root: HTMLElement): void => {
+    if (characterCountFocusIntent) {
+      const countInput = root.querySelector('.lt-toolbar__count-field input')
+      if (countInput instanceof HTMLInputElement) {
+        countInput.focus()
+        try { countInput.setSelectionRange(characterCountCaret, characterCountCaret) } catch { /* text input caret restoration is best-effort */ }
+        return
+      }
+    }
     if (!prevSlot) return
     const input = root.querySelector(`input[data-lt-search="${prevSlot}"]`)
     if (!(input instanceof HTMLInputElement)) return
@@ -556,7 +566,12 @@ export function renderCharactersSection(options: {
     }))
     const countInput = countField.querySelector('input') as HTMLInputElement | null
     if (countInput) {
+      on(countInput, 'focus', () => { characterCountFocusIntent = true })
+      on(countInput, 'blur', () => { if (countInput.isConnected) characterCountFocusIntent = false })
+      on(countInput, 'keyup', () => { characterCountCaret = countInput.selectionStart ?? countInput.value.length })
+      on(countInput, 'click', () => { characterCountCaret = countInput.selectionStart ?? countInput.value.length })
       on(countInput, 'input', () => {
+        characterCountCaret = countInput.selectionStart ?? countInput.value.length
         const value = countInput.value
         if (characterCountTimer) clearTimeout(characterCountTimer)
         characterCountTimer = setTimeout(() => store.actions.setCharacterCountFilter(value), SEARCH_DEBOUNCE_MS)
