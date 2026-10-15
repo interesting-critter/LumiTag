@@ -42,6 +42,7 @@ import {
   type PlanInput,
 } from './mutations/planner'
 import type { CharacterRepository } from './repository'
+import { matchesCountFilter, parseCountFilter } from './count-filter'
 
 // ---------------------------------------------------------------------------
 // Public view contract
@@ -140,6 +141,7 @@ export interface StoreView {
   /** Characters matching a `C:` search in the Tags section, with their tags. */
   tagQueryCharacters: CharacterListRow[]
   tagSort: TagSortMode
+  tagCountFilter: string
   tagMode: TagMode
   selectedTagKeys: string[]
   selectedTagCount: number
@@ -165,6 +167,7 @@ export interface StoreView {
   characterQueryErrors: QuerySyntaxError[]
   characterSort: CharacterSortMode
   characterTagFilter: CharacterTagFilter
+  characterCountFilter: string
   activeFilterTagKeys: string[]
   selectedCharacterIds: string[]
   selectedAssignTagKeys: string[]
@@ -221,6 +224,7 @@ export interface TagManagerActions {
   setSection(s: Section): void
   setTagQuery(q: string): void
   setTagSort(m: TagSortMode): void
+  setTagCountFilter(value: string): void
   toggleTagExpanded(key: string): void
   setTagMode(m: TagMode): void
   setMergePrimary(key: string | null): void
@@ -234,6 +238,7 @@ export interface TagManagerActions {
   setTagPage(page: number): void
   setCharacterSort(m: CharacterSortMode): void
   setCharacterTagFilter(f: CharacterTagFilter): void
+  setCharacterCountFilter(value: string): void
   setActiveFilterTags(keys: string[]): void
   toggleCharacterSelected(id: string, selected?: boolean): void
   selectAllVisibleCharacters(): void
@@ -308,6 +313,7 @@ interface StoreState {
   selectedTagKeys: Set<string>
   tagQuery: string
   tagSort: TagSortMode
+  tagCountFilter: string
   tagMode: TagMode
   mergePrimaryKey: string | null
   mergeTargetKeys: Set<string>
@@ -318,6 +324,7 @@ interface StoreState {
   /** Zero-based page of the TAG list. View-only; see PAGE_SIZE. */
   tagPage: number
   characterTagFilter: CharacterTagFilter
+  characterCountFilter: string
   activeFilterTagKeys: Set<string>
   selectedCharacterIds: Set<string>
   selectedAssignTagKeys: Set<string>
@@ -338,6 +345,7 @@ function initialState(): StoreState {
     selectedTagKeys: new Set(),
     tagQuery: '',
     tagSort: 'name_asc',
+    tagCountFilter: '',
     tagMode: 'normal',
     mergePrimaryKey: null,
     mergeTargetKeys: new Set(),
@@ -346,6 +354,7 @@ function initialState(): StoreState {
     characterPage: 0,
     tagPage: 0,
     characterTagFilter: 'all',
+    characterCountFilter: '',
     activeFilterTagKeys: new Set(),
     selectedCharacterIds: new Set(),
     selectedAssignTagKeys: new Set(),
@@ -373,6 +382,7 @@ export class TagManagerStore {
     characters: LumiTagCharacter[]
     query: string
     sort: TagSortMode
+    countFilter: string
     expanded: string
     selectedTags: string
     selectedCharacters: string
@@ -384,6 +394,7 @@ export class TagManagerStore {
     query: string
     sort: CharacterSortMode
     filter: CharacterTagFilter
+    countFilter: string
     filterTags: string
     selectedCharacters: string
     value: ReturnType<TagManagerStore['computeCharacterRows']>
@@ -690,6 +701,7 @@ export class TagManagerStore {
       cached.characters === s.characters &&
       cached.query === s.tagQuery &&
       cached.sort === s.tagSort &&
+      cached.countFilter === s.tagCountFilter &&
       cached.expanded === expanded &&
       cached.selectedTags === selectedTags &&
       cached.selectedCharacters === selectedCharacters
@@ -712,7 +724,11 @@ export class TagManagerStore {
       : parsed.errors.length > 0
         ? filterByBestEffortTerms(s.tagIndex.tags, parsed.query)
         : filterTagsByQuery(s.tagIndex.tags, parsed.query, s.tagQuery)
-    const sorted = sortTags(nameFiltered, s.tagSort)
+    const parsedCountFilter = parseCountFilter(s.tagCountFilter)
+    const countFiltered = parsedCountFilter.valid && parsedCountFilter.filter.kind !== 'any'
+      ? nameFiltered.filter((entry) => matchesCountFilter(parsedCountFilter.filter, entry.count))
+      : nameFiltered
+    const sorted = sortTags(countFiltered, s.tagSort)
     const rows = sorted.map((entry) => ({
       entry,
       expanded: s.expandedTagKeys.has(entry.key),
@@ -736,6 +752,7 @@ export class TagManagerStore {
       characters: s.characters,
       query: s.tagQuery,
       sort: s.tagSort,
+      countFilter: s.tagCountFilter,
       expanded,
       selectedTags,
       selectedCharacters,
@@ -756,6 +773,7 @@ export class TagManagerStore {
       cached.query === s.characterQuery &&
       cached.sort === s.characterSort &&
       cached.filter === s.characterTagFilter &&
+      cached.countFilter === s.characterCountFilter &&
       cached.filterTags === filterTagsSignature &&
       cached.selectedCharacters === selectedCharacters
     ) return cached.value
@@ -769,8 +787,10 @@ export class TagManagerStore {
 
     const filterTags = [...s.activeFilterTagKeys].map((key) => s.tagIndex.byKey.get(key)?.key ?? key)
     const filter = s.characterTagFilter
+    const parsedCountFilter = parseCountFilter(s.characterCountFilter)
 
     const filtered = searched.filter((character) => {
+      if (parsedCountFilter.valid && !matchesCountFilter(parsedCountFilter.filter, readTags(character).length)) return false
       const keys = new Set(readTags(character).map((t) => t.toLowerCase()))
       switch (filter) {
         case 'all':
@@ -829,6 +849,7 @@ export class TagManagerStore {
       query: s.characterQuery,
       sort: s.characterSort,
       filter: s.characterTagFilter,
+      countFilter: s.characterCountFilter,
       filterTags: filterTagsSignature,
       selectedCharacters,
       value,
@@ -868,6 +889,7 @@ export class TagManagerStore {
       tagQueryIsCharacterMode: tagSide.isCharacterMode,
       tagQueryCharacters: tagSide.characters,
       tagSort: s.tagSort,
+      tagCountFilter: s.tagCountFilter,
       tagMode: s.tagMode,
       selectedTagKeys: [...s.selectedTagKeys].sort(),
       selectedTagCount: s.selectedTagKeys.size,
@@ -885,6 +907,7 @@ export class TagManagerStore {
       characterQueryErrors: characterSide.errors,
       characterSort: s.characterSort,
       characterTagFilter: s.characterTagFilter,
+      characterCountFilter: s.characterCountFilter,
       activeFilterTagKeys: [...s.activeFilterTagKeys].sort(),
       selectedCharacterIds: [...s.selectedCharacterIds].sort(),
       selectedAssignTagKeys: selectedAssign,
@@ -920,6 +943,13 @@ export class TagManagerStore {
     setTagSort: (tagSort) => {
       if (this.state.tagSort === tagSort) return
       this.state.tagSort = tagSort
+      this.state.tagPage = 0
+      this.commit()
+    },
+
+    setTagCountFilter: (value) => {
+      if (this.state.tagCountFilter === value) return
+      this.state.tagCountFilter = value
       this.state.tagPage = 0
       this.commit()
     },
@@ -1031,6 +1061,13 @@ export class TagManagerStore {
     setCharacterTagFilter: (characterTagFilter) => {
       if (this.state.characterTagFilter === characterTagFilter) return
       this.state.characterTagFilter = characterTagFilter
+      this.state.characterPage = 0
+      this.commit()
+    },
+
+    setCharacterCountFilter: (value) => {
+      if (this.state.characterCountFilter === value) return
+      this.state.characterCountFilter = value
       this.state.characterPage = 0
       this.commit()
     },

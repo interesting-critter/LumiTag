@@ -2166,4 +2166,22 @@ export const LUMITAG_CSS = `
   .lt-character-row {
     border-bottom-color: var(--lumiverse-border-hover, var(--lumiverse-border, CanvasText));
   }
+}
+
+/* Count filters share toolbar space with sort/tag filters without forcing
+   their intrinsic option/input widths onto the whole row. */
+.lt-toolbar__count-field {
+  flex: 0 1 150px;
+  max-width: 180px;
+  min-width: 100px;
+}
+.lt-toolbar__count-field .lt-input { width: 100%; min-width: 0; box-sizing: border-box; }
+.lt-toolbar__filter-field {
+  flex: 0 1 190px;
+  max-width: 220px;
+  min-width: 130px;
+}
+.lt-toolbar__filter-field .lt-selectfield,
+.lt-toolbar__filter-field .lt-select { min-width: 0; width: 100%; }
+
 }`
