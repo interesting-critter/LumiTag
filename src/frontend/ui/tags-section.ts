@@ -348,7 +348,7 @@ export function renderTagsSection(options: {
       field(
         'Sort by',
         select(SORT_OPTIONS, view.tagSort, (value) => store.actions.setTagSort(value)),
-        '',
+        '“Only 0 Characters” lists tags nothing is assigned to',
       ),
     )
     const countField = field('Characters assigned', el('input', {
