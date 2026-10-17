@@ -73,6 +73,7 @@ import {
   pageCountFor,
 } from '../store'
 import { tagKey } from '../tag-index'
+import { parseCountFilter } from '../count-filter'
 import { requestDialog } from './dialog-host'
 import {
   avatar,
@@ -98,6 +99,10 @@ import {
  * A PAGE size, not a cap: the picker is paged exactly like the two lists, so
  * every existing tag is reachable by paging rather than only by searching.
  */
+let characterCountTimer: ReturnType<typeof setTimeout> | null = null
+let characterCountFocusIntent = false
+let characterCountCaret = 0
+
 const TAG_OPTION_LIMIT = 200
 
 /**
@@ -438,6 +443,14 @@ export function renderCharactersSection(options: {
    * cleared, so the intent is honoured by the frame that does build it.
    */
   const restoreSearchIntents = (root: HTMLElement): void => {
+    if (characterCountFocusIntent) {
+      const countInput = root.querySelector('.lt-toolbar__count-field input')
+      if (countInput instanceof HTMLInputElement) {
+        countInput.focus()
+        try { countInput.setSelectionRange(characterCountCaret, characterCountCaret) } catch { /* text input caret restoration is best-effort */ }
+        return
+      }
+    }
     if (!prevSlot) return
     const input = root.querySelector(`input[data-lt-search="${prevSlot}"]`)
     if (!(input instanceof HTMLInputElement)) return
@@ -538,15 +551,36 @@ export function renderCharactersSection(options: {
       ),
     )
 
-    bar.appendChild(
-      field(
-        'Filter by tags',
-        select(FILTER_OPTIONS, view.characterTagFilter, (value) =>
-          store.actions.setCharacterTagFilter(value),
-        ),
-        '',
+    const tagFilterField = field(
+      'Filter by tags',
+      select(FILTER_OPTIONS, view.characterTagFilter, (value) =>
+        store.actions.setCharacterTagFilter(value),
       ),
+      '',
     )
+    tagFilterField.setAttribute('class', `${tagFilterField.getAttribute('class') ?? 'lt-field'} lt-toolbar__filter-field`)
+    bar.appendChild(tagFilterField)
+    const countField = field('Number of tags', el('input', {
+      class: 'lt-input lt-count-filter', type: 'text', placeholder: 'e.g. <10, 10-15',
+      value: view.characterCountFilter, 'aria-label': 'Filter by number of tags',
+    }))
+    const countInput = countField.querySelector('input') as HTMLInputElement | null
+    if (countInput) {
+      on(countInput, 'focus', () => { characterCountFocusIntent = true })
+      on(countInput, 'blur', () => { if (countInput.isConnected) characterCountFocusIntent = false })
+      on(countInput, 'keyup', () => { characterCountCaret = countInput.selectionStart ?? countInput.value.length })
+      on(countInput, 'click', () => { characterCountCaret = countInput.selectionStart ?? countInput.value.length })
+      on(countInput, 'input', () => {
+        characterCountCaret = countInput.selectionStart ?? countInput.value.length
+        const value = countInput.value
+        if (characterCountTimer) clearTimeout(characterCountTimer)
+        characterCountTimer = setTimeout(() => store.actions.setCharacterCountFilter(value), SEARCH_DEBOUNCE_MS)
+      })
+      const parsed = parseCountFilter(view.characterCountFilter)
+      if (!parsed.valid) countField.appendChild(el('span', { class: 'lt-field__error' }, [parsed.error]))
+    }
+    countField.setAttribute('class', `${countField.getAttribute('class') ?? 'lt-field'} lt-toolbar__count-field`)
+    bar.appendChild(countField)
 
     return bar
   }
