@@ -7,7 +7,7 @@
  *  1. **No `innerHTML`, ever.** User data (character names, tag names, backend
  *     error messages) is always appended as a real `Text` node via `text()`,
  *     so no character can inject markup or attributes into the host document.
- *     The only geometry-bearing nodes are the three STATIC icon constants at the
+ *     The only geometry-bearing nodes are the static icon constants at the
  *     bottom of this file, built with `createElementNS` — not with markup
  *     injection — and none of them ever carries user data.
  *  2. **Every icon-only / destructive control carries an `aria-label`.** A
@@ -808,3 +808,14 @@ const SEARCH_ICON = [
 
 /** Lucide `chevron-down` — the select trigger chevron. */
 const CHEVRON_DOWN_ICON = ['m6 9 6 6 6-6'] as const
+
+/** Lucide `check` — the merge banner's primary-status mark. */
+const CHECK_ICON = ['M20 6 9 17l-5-5'] as const
+
+/** Lucide `x` — the merge banner's primary-status mark. */
+const X_ICON = ['M18 6 6 18', 'm6 6 12 12'] as const
+
+/** Lucide `check` / `x` — the merge banner's primary-status mark. */
+export function statusMark(kind: 'check' | 'x', cls: string): HTMLElement | null {
+  return icon(kind === 'check' ? CHECK_ICON : X_ICON, cls)
+}
