@@ -72,6 +72,7 @@ import {
   select,
   setDisabled,
   spinner,
+  statusMark,
   text,
 } from './dom'
 
@@ -659,7 +660,7 @@ export function renderTagsSection(options: {
     const node = el('div', { class: classes.join(' ') })
     node.setAttribute('role', 'listitem')
     node.dataset['tagKey'] = entry.key
-    if (mode !== 'normal') node.setAttribute('aria-selected', row.selected ? 'true' : 'false')
+    if (mode !== 'normal') node.setAttribute('aria-selected', row.selected || isPrimary || isTarget ? 'true' : 'false')
 
     // --- selection control -------------------------------------------------
     if (mode === 'merge') {
@@ -901,11 +902,18 @@ export function renderTagsSection(options: {
       'aria-label': 'Merge controls',
     })
     banner.appendChild(badge('Merge Mode', { tone: 'accent' }))
+    const primaryChosen = view.mergePrimaryKey !== null
+    const targetCount = view.mergeTargetKeys.length
+    const mark = statusMark(primaryChosen ? 'check' : 'x', primaryChosen ? 'lt-banner__status--ok' : 'lt-banner__status--missing')
     banner.appendChild(
-      el('strong', {}, [
-        `${view.selectedTagCount} ${
-          view.selectedTagCount === 1 ? 'tag' : 'tags'
-        } selected`,
+      el('strong', {
+        class: 'lt-banner__status',
+        'aria-label': primaryChosen
+          ? `primary tag chosen, ${targetCount} ${targetCount === 1 ? 'target' : 'targets'} selected`
+          : `no primary tag chosen, ${targetCount} ${targetCount === 1 ? 'target' : 'targets'} selected`,
+      }, [
+        ...(mark !== null ? [mark] : []),
+        text(`primary — ${targetCount} ${targetCount === 1 ? 'target' : 'targets'} selected`),
       ]),
     )
     banner.appendChild(

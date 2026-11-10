@@ -884,6 +884,11 @@ export const LUMITAG_CSS = `
 
 .lt-toolbar__banner strong { color: var(--lumiverse-text, CanvasText); font-weight: 600; }
 
+.lt-banner__status { display: inline-flex; align-items: center; gap: 6px; }
+.lt-banner__status svg { display: block; width: 14px; height: 14px; }
+.lt-banner__status--ok { color: var(--lumiverse-success, var(--lumiverse-primary, currentColor)); }
+.lt-banner__status--missing { color: var(--lumiverse-danger, currentColor); }
+
 .lt-toolbar--busy { opacity: 0.85; }
 
 /*

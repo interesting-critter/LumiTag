@@ -55,8 +55,7 @@ let requestCounter = 0
 
 function nextRequestId(): string {
   requestCounter += 1
-  const random = typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function' ? crypto.randomUUID() : Math.random().toString(36).slice(2)
-  return `lt-${random}-${requestCounter}`
+  return `lt-${requestCounter}`
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

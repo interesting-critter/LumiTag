@@ -564,3 +564,95 @@ describe('tags section search focus restoration', () => {
     expect(container.childNodes.length).toBe(0)
   })
 })
+
+describe('tags section merge banner', () => {
+  /**
+   * The stub above has no `createElementNS`, so `statusMark()` (like every
+   * icon builder in `ui/dom`) returns `null` under test and the banner renders
+   * text-only. The SVG path data (`M20 6 9 17l-5-5` for `check`,
+   * `M18 6 6 18` / `m6 6 12 12` for `x`) is therefore NOT assertable here —
+   * asserting it would require a real DOM or a stub extension, and this file
+   * deliberately keeps the stub minimal. Text and aria-label are asserted
+   * instead; the icon itself is covered by inspection against the Lucide
+   * sources.
+   */
+  function textOf(node: StubElement | StubText): string {
+    if (node instanceof StubText) return node.data
+    return node.childNodes.map(textOf).join('')
+  }
+
+  function bannerStatus(container: StubElement): StubElement {
+    const found = container.querySelectorAll('strong.lt-banner__status')
+    expect(found.length).toBe(1)
+    return found[0] as StubElement
+  }
+
+  test('a chosen primary with two targets reads “primary — 2 targets selected”', () => {
+    currentDoc = installDom()
+    const doc = currentDoc
+    const container = newContainer(doc)
+
+    mount(
+      container,
+      makeView({
+        tagMode: 'merge',
+        mergePrimaryKey: 'elf',
+        mergeTargetKeys: ['dark', 'magic'],
+        selectedTagKeys: [],
+        selectedTagCount: 0,
+      }),
+    )
+
+    const status = bannerStatus(container)
+    expect(textOf(status)).toContain('primary — 2 targets selected')
+    expect(status.getAttribute('aria-label')).toBe('primary tag chosen, 2 targets selected')
+  })
+
+  test('no primary with one target reads “primary — 1 target selected”', () => {
+    currentDoc = installDom()
+    const doc = currentDoc
+    const container = newContainer(doc)
+
+    // Targets can be ticked before the primary radio is — the banner has to
+    // say so rather than imply a primary exists.
+    mount(
+      container,
+      makeView({
+        tagMode: 'merge',
+        mergePrimaryKey: null,
+        mergeTargetKeys: ['dark'],
+        selectedTagKeys: [],
+        selectedTagCount: 0,
+      }),
+    )
+
+    const status = bannerStatus(container)
+    expect(textOf(status)).toContain('primary — 1 target selected')
+    expect(status.getAttribute('aria-label')).toBe('no primary tag chosen, 1 target selected')
+  })
+
+  test('a merge target row is exposed as aria-selected, matching its class', () => {
+    currentDoc = installDom()
+    const doc = currentDoc
+    const container = newContainer(doc)
+
+    mount(
+      container,
+      makeView({
+        tagMode: 'merge',
+        mergePrimaryKey: 'elf',
+        mergeTargetKeys: ['forest'],
+        selectedTagKeys: [],
+        selectedTagCount: 0,
+      }),
+    )
+
+    // `renderTagRow` stamps the row node with `dataset['tagKey']`; rows are
+    // plain `div.lt-tag-row` listitems.
+    const rows = container.querySelectorAll('div.lt-tag-row')
+    const byKey = new Map(rows.map((row) => [row.dataset['tagKey'], row]))
+    expect(byKey.get('forest')?.getAttribute('aria-selected')).toBe('true')
+    expect(byKey.get('elf')?.getAttribute('aria-selected')).toBe('true')
+    expect(byKey.get('ranger')?.getAttribute('aria-selected')).toBe('false')
+  })
+})
