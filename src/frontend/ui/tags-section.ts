@@ -53,6 +53,7 @@ import {
   type TagMode,
 } from '../store'
 import { charactersForTag } from '../tag-index'
+import { characterAvatarUrl } from '../repository'
 import { parseCountFilter } from '../count-filter'
 import { TAG_SORT_LABELS, TAG_SORT_MODES } from '../tag-sorting'
 import type { TagSortMode } from '../tag-sorting'
@@ -136,11 +137,6 @@ let searchCaret = 0
  * that the debounce itself causes, or typing would never commit at all.
  */
 let searchTimer: ReturnType<typeof setTimeout> | null = null
-
-/** Session-authenticated, read-only avatar endpoint for a character. */
-function avatarUrl(id: string): string {
-  return `/api/v1/characters/${encodeURIComponent(id)}/avatar`
-}
 
 /** A short, human-scannable form of a character id. */
 function shortId(id: string): string {
@@ -531,7 +527,7 @@ export function renderTagsSection(options: {
       item.setAttribute('role', 'listitem')
       item.appendChild(
         el('div', { class: 'lt-row lt-row--wrap' }, [
-          avatar(avatarUrl(id), name, 28),
+          avatar(characterAvatarUrl(id), name, 28),
           el('span', { class: 'lt-character-row__name' }, [display]),
           badge(shortId(id), { tone: 'muted' }),
           badge(tagCountLabel(tags.length)),
@@ -792,7 +788,7 @@ export function renderTagsSection(options: {
       const name = names.get(id) ?? ''
       const tags = view.tagIndex.byCharacterId.get(id) ?? []
       const item = el('div', { class: 'lt-row lt-row--wrap' }, [
-        avatar(avatarUrl(id), name, 24),
+        avatar(characterAvatarUrl(id), name, 24),
         el('span', { class: 'lt-character-row__name' }, [
           name === '' ? '(unnamed character)' : name,
         ]),
@@ -849,11 +845,12 @@ export function renderTagsSection(options: {
 
     const actions = el('div', { class: 'lt-toolbar__actions' })
     actions.appendChild(
-      button('Select All (currently displayed list only)', {
+      button('Select All (matching tags)', {
         title:
-          'Select only the tags shown by your current search, sort and filters — this does NOT ' +
-          'select every tag in your library',
-        ariaLabel: 'Select all tags in the currently displayed list, not the whole library',
+          'Select every tag matching your current search, sort and filters, across ALL pages. ' +
+          'With no search or filters active this selects your whole tag catalog.',
+        ariaLabel:
+          'Select every tag matching the current search and filters across all pages (with no filters, the whole catalog)',
         onClick: () => store.actions.selectAllVisibleTags(),
       }),
     )

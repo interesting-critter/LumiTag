@@ -3,23 +3,23 @@ import {
   BACKEND_PAGE_LIMIT,
   type CharacterListPage,
   type CharacterTags,
-  type LumiTagCharacter,
+  type LumiTagCharacterWire,
 } from '../shared/types'
 import type { SpindleRpc } from './rpc'
 
 /**
  * The narrow mutation surface the executor is allowed to depend on.
  *
- * Both granularities are part of the contract. `execute()` uses ONLY the batch
- * methods — one message for the whole operation — because a per-character
- * round trip per character is what exhausted the host on large bulk edits. The
- * single-character methods stay because the retry path re-reads exactly one
- * character on purpose: a retry's safety depends on seeing that one record's
- * current tags before deciding what to write.
+ * Both granularities are part of the contract. `execute()` and the retry
+ * path use ONLY the batch methods — one message per phase of an operation,
+ * however many characters it touches. The single-character methods stay for
+ * targeted callers (e.g. the store's chip-removal confirm path); a retry's
+ * safety comes from re-reading the CURRENT tags before writing, and that now
+ * happens in one batched `getTagsBatch` rather than once per character.
  */
 export interface CharacterMutationPort {
-  getCharacter(id: string): Promise<LumiTagCharacter | null>
-  updateTags(id: string, tags: string[]): Promise<LumiTagCharacter>
+  getCharacter(id: string): Promise<LumiTagCharacterWire | null>
+  updateTags(id: string, tags: string[]): Promise<LumiTagCharacterWire>
   getTagsBatch(ids: readonly string[]): Promise<Map<string, CharacterTags>>
   updateTagsBatch(
     updates: { characterId: string; tags: string[] }[],
@@ -31,6 +31,30 @@ function clampLimit(value: number | undefined): number {
   const floored = Math.floor(value)
   if (floored < 1) return 1
   return Math.min(floored, BACKEND_PAGE_LIMIT)
+}
+
+/**
+ * Avatar image URL for `<img src>`.
+ *
+ * Why a plain URL is acceptable here: it is a same-origin, GET-only,
+ * session-authenticated endpoint (`/api/v1/characters/:id/avatar`) that the
+ * host already authorizes per-user from the session cookie. Embedding it as an
+ * image src carries no extension token, no bearer credential and no
+ * user-supplied origin — the browser attaches the session cookie exactly as it
+ * would for any other Lumiverse asset, and the host's existing ETag/If-None-Match
+ * caching still applies. Fetching bytes through the backend instead would mean
+ * base64 round-tripping megabytes of avatar data through the message channel
+ * for zero added safety.
+ *
+ * Note the path is derived from the character id only; `image_id` is exposed
+ * on the DTO but deliberately NOT used, because the resolver endpoint already
+ * applies the crop/legacy-path fallback chain authoritatively.
+ *
+ * This is the ONE source of truth for the avatar URL; the repository method
+ * below and every UI call site delegate here.
+ */
+export function characterAvatarUrl(id: string): string {
+  return `/api/v1/characters/${encodeURIComponent(id)}/avatar`
 }
 
 /**
@@ -75,9 +99,9 @@ export class CharacterRepository implements CharacterMutationPort {
    */
   async listAllCharacters(
     onProgress?: (loaded: number, total: number) => void,
-  ): Promise<LumiTagCharacter[]> {
+  ): Promise<LumiTagCharacterWire[]> {
     const seen = new Set<string>()
-    const all: LumiTagCharacter[] = []
+    const all: LumiTagCharacterWire[] = []
     let offset = 0
 
     for (;;) {
@@ -100,7 +124,7 @@ export class CharacterRepository implements CharacterMutationPort {
     return all
   }
 
-  async getCharacter(id: string): Promise<LumiTagCharacter | null> {
+  async getCharacter(id: string): Promise<LumiTagCharacterWire | null> {
     const response = await this.rpc.request<BackendResponse['type']>({
       type: 'characters.get',
       characterId: id,
@@ -116,7 +140,7 @@ export class CharacterRepository implements CharacterMutationPort {
    * failures from `SpindleRpcError.code` / `.retryable`, so this must not
    * catch-and-rethrow.
    */
-  async updateTags(id: string, tags: string[]): Promise<LumiTagCharacter> {
+  async updateTags(id: string, tags: string[]): Promise<LumiTagCharacterWire> {
     const response = await this.rpc.request<BackendResponse['type']>({
       type: 'characters.updateTags',
       characterId: id,
@@ -187,24 +211,11 @@ export class CharacterRepository implements CharacterMutationPort {
   }
 
   /**
-   * Avatar image URL for `<img src>`.
-   *
-   * Why a plain URL is acceptable here: it is a same-origin, GET-only,
-   * session-authenticated endpoint (`/api/v1/characters/:id/avatar`) that the
-   * host already authorizes per-user from the session cookie. Embedding it as an
-   * image src carries no extension token, no bearer credential and no
-   * user-supplied origin — the browser attaches the session cookie exactly as it
-   * would for any other Lumiverse asset, and the host's existing ETag/If-None-Match
-   * caching still applies. Fetching bytes through the backend instead would mean
-   * base64 round-tripping megabytes of avatar data through the message channel
-   * for zero added safety.
-   *
-   * Note the path is derived from the character id only; `image_id` is exposed
-   * on the DTO but deliberately NOT used, because the resolver endpoint already
-   * applies the crop/legacy-path fallback chain authoritatively.
+   * Avatar image URL for `<img src>`. See the module-level `characterAvatarUrl`
+   * for the full rationale; this delegate exists so existing callers keep working.
    */
   avatarUrl(id: string): string {
-    return `/api/v1/characters/${encodeURIComponent(id)}/avatar`
+    return characterAvatarUrl(id)
   }
 }
 

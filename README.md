@@ -66,8 +66,3 @@ fantasy T:dark                     name contains "fantasy" AND tagged "dark"
 `T:` and `C:` scope the term that follows them. Prefixing a term with `-`
 excludes it. Spaces mean AND and commas mean OR; use both for groups.
 
-## Documentation
-
-`DEVELOPMENT_NOTES.md` documents the verified Lumiverse Spindle API surface, the
-permission model, the backend/frontend split, known API limitations, and the
-implementation plan.

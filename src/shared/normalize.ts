@@ -1,4 +1,4 @@
-import type { CharacterTags, LumiTagCharacter } from './types'
+import type { CharacterTags, LumiTagCharacter, LumiTagCharacterWire } from './types'
 
 function readString(value: unknown): string {
   return typeof value === 'string' ? value : ''
@@ -45,6 +45,41 @@ export function normalizeCharacterTagsOnly(raw: unknown): CharacterTags {
   const source: Record<string, unknown> =
     typeof raw === 'object' && raw !== null ? (raw as Record<string, unknown>) : {}
   return { id: readString(source.id), tags: normalizeCharacterTags(source.tags) }
+}
+
+/**
+ * Normalize a raw (possibly partial, possibly not-an-object) character DTO
+ * into the SLIM worker→frontend projection (`LumiTagCharacterWire`).
+ *
+ * This is what the backend puts on the wire for `characters.list`,
+ * `characters.get` and `characters.updateTags`. The frontend never reads a
+ * character's prompt body, so the reply carries exactly
+ * `{ id, name, tags, image_id, created_at, updated_at }` — the prompt fields
+ * are ABSENT, not empty-filled, so the saved bytes stay saved.
+ *
+ * Like `normalizeCharacter`, this NEVER throws: unknown/garbage input yields a
+ * zero-valued character with an empty `id`. The worker boundary is untrusted
+ * (messages come off a transport), so a single malformed DTO must not be able
+ * to take down the backend worker.
+ *
+ * The `id` is whitespace-normalized (trimmed) because it doubles as a map
+ * key everywhere downstream; `name` passes through with the same defensive
+ * string coercion the rest of this module uses.
+ */
+export function normalizeCharacterWire(raw: unknown): LumiTagCharacterWire {
+  const source: Record<string, unknown> =
+    typeof raw === 'object' && raw !== null ? (raw as Record<string, unknown>) : {}
+
+  const imageId = source.image_id
+
+  return {
+    id: readString(source.id).trim(),
+    name: readString(source.name),
+    tags: normalizeCharacterTags(source.tags),
+    image_id: typeof imageId === 'string' && imageId.length > 0 ? imageId : null,
+    created_at: readNumber(source.created_at),
+    updated_at: readNumber(source.updated_at),
+  }
 }
 
 /**

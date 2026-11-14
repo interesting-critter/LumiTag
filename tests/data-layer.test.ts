@@ -1,12 +1,12 @@
 import { beforeEach, describe, expect, test } from 'bun:test'
 
 import type { SpindleAPI } from 'lumiverse-spindle-types'
-import { normalizeCharacter, normalizeCharacterTags, normalizeCharacterTagsOnly } from '../src/shared/normalize'
+import { normalizeCharacter, normalizeCharacterWire, normalizeCharacterTags, normalizeCharacterTagsOnly } from '../src/shared/normalize'
 import type { BackendRequest, BackendResponse } from '../src/shared/protocol'
 import { BACKEND_PAGE_LIMIT, type LumiTagCharacter } from '../src/shared/types'
 import { mapWithConcurrency } from '../src/frontend/concurrency'
 import { SpindleRpc, SpindleRpcError } from '../src/frontend/rpc'
-import { CharacterRepository } from '../src/frontend/repository'
+import { CharacterRepository, characterAvatarUrl } from '../src/frontend/repository'
 
 /* -------------------------------------------------------------------------- */
 /* helpers                                                                    */
@@ -128,6 +128,89 @@ describe('normalizeCharacterTags', () => {
     const copy = [...input]
     normalizeCharacterTags(input)
     expect(input).toEqual(copy)
+  })
+})
+
+/* -------------------------------------------------------------------------- */
+/* normalizeCharacterWire                                                      */
+/* -------------------------------------------------------------------------- */
+
+describe('normalizeCharacterWire', () => {
+  test('ships exactly the frontend-bound keys; prompt fields are absent, not empty-filled', () => {
+    const result = normalizeCharacterWire({
+      id: 'c1',
+      name: 'Aria',
+      description: 'a very long body',
+      personality: 'a long personality',
+      scenario: 'a long scenario',
+      creator: 'someone',
+      creator_notes: 'private notes',
+      system_prompt: 'a long system prompt',
+      tags: [' Elf ', 'elf', ' Wizard '],
+      image_id: 'img-1',
+      created_at: 10,
+      updated_at: 20,
+    })
+
+    expect(result).toEqual({
+      id: 'c1',
+      name: 'Aria',
+      tags: ['Elf', 'Wizard'],
+      image_id: 'img-1',
+      created_at: 10,
+      updated_at: 20,
+    })
+    expect(Object.keys(result)).toEqual(['id', 'name', 'tags', 'image_id', 'created_at', 'updated_at'])
+    for (const promptField of ['description', 'personality', 'scenario', 'creator', 'creator_notes', 'system_prompt']) {
+      expect(result).not.toHaveProperty(promptField)
+    }
+  })
+
+  test('keeps image_id / created_at / updated_at with the same coercion rules as normalizeCharacter', () => {
+    const result = normalizeCharacterWire({ id: 'c', image_id: 'img-1', created_at: 10, updated_at: 20 })
+    expect(result.image_id).toBe('img-1')
+    expect(result.created_at).toBe(10)
+    expect(result.updated_at).toBe(20)
+
+    const blanked = normalizeCharacterWire({ id: 'c', image_id: '', created_at: NaN, updated_at: 'x' })
+    expect(blanked.image_id).toBe(null)
+    expect(blanked.created_at).toBe(0)
+    expect(blanked.updated_at).toBe(0)
+  })
+
+  test('normalizes tags identically to normalizeCharacter', () => {
+    const raw = { id: 'c1', tags: [' Elf ', 42, 'elf', '', ' Wizard '], image_id: 'i', created_at: 1, updated_at: 2 }
+    expect(normalizeCharacterWire(raw).tags).toEqual(normalizeCharacter(raw).tags)
+    expect(normalizeCharacterWire(raw).tags).toEqual(['Elf', 'Wizard'])
+  })
+
+  test('whitespace-normalizes the id and coerces name like the existing defensive style', () => {
+    expect(normalizeCharacterWire({ id: '  c1\n', name: 'Aria' }).id).toBe('c1')
+    expect(normalizeCharacterWire({ id: 42, name: 7 }).name).toBe('')
+    expect(normalizeCharacterWire({ id: '\t x ', name: 'Aria' }).id).toBe('x')
+  })
+
+  test('null / undefined / garbage input does not throw and yields a zero-valued character', () => {
+    expect(() => normalizeCharacterWire(null)).not.toThrow()
+    expect(normalizeCharacterWire(null)).toEqual({
+      id: '',
+      name: '',
+      tags: [],
+      image_id: null,
+      created_at: 0,
+      updated_at: 0,
+    })
+    expect(normalizeCharacterWire(undefined).id).toBe('')
+    expect(normalizeCharacterWire('nope').tags).toEqual([])
+    expect(normalizeCharacterWire(42).image_id).toBe(null)
+    expect(normalizeCharacterWire([1, 2])).toEqual({
+      id: '',
+      name: '',
+      tags: [],
+      image_id: null,
+      created_at: 0,
+      updated_at: 0,
+    })
   })
 })
 
@@ -371,6 +454,27 @@ describe('SpindleRpc', () => {
     rpc.dispose()
   })
 
+  test('rejects an updateTags reply with a missing or non-object character', async () => {
+    const fake = createFakeCtx()
+    const rpc = new SpindleRpc(fake.ctx)
+
+    for (const badCharacter of [undefined, null, 'nope', 42, []]) {
+      const pending = rpc.request({ type: 'characters.updateTags', characterId: 'c1', tags: ['Elf'] })
+      await flush()
+
+      const reply: Record<string, unknown> = {
+        type: 'characters.updateTags.result',
+        requestId: fake.sent[fake.sent.length - 1]!.requestId,
+      }
+      if (badCharacter !== undefined) reply.character = badCharacter
+      fake.emit(reply)
+
+      await expect(pending).rejects.toMatchObject({ code: 'protocol_error', retryable: false })
+    }
+    expect(rpc.pendingCount).toBe(0)
+    rpc.dispose()
+  })
+
   test('rejects when the transport itself throws on send', async () => {
     const fake = createFakeCtx()
     fake.ctx.sendToBackend = () => {
@@ -584,11 +688,13 @@ describe('CharacterRepository.updateTags', () => {
   })
 })
 
-describe('CharacterRepository.avatarUrl', () => {
+describe('characterAvatarUrl (shared avatar URL helper)', () => {
   test('builds the read-only avatar endpoint and encodes the id', () => {
+    expect(characterAvatarUrl('abc-123')).toBe('/api/v1/characters/abc-123/avatar')
+    expect(characterAvatarUrl('a/b?c=d')).toBe('/api/v1/characters/a%2Fb%3Fc%3Dd/avatar')
+    // The repository method delegates to the same helper.
     const repo = new CharacterRepository({} as unknown as SpindleRpc)
-    expect(repo.avatarUrl('abc-123')).toBe('/api/v1/characters/abc-123/avatar')
-    expect(repo.avatarUrl('a/b?c=d')).toBe('/api/v1/characters/a%2Fb%3Fc%3Dd/avatar')
+    expect(repo.avatarUrl('abc-123')).toBe(characterAvatarUrl('abc-123'))
   })
 })
 /* -------------------------------------------------------------------------- */
@@ -759,19 +865,16 @@ describe('backend forwards the envelope userId to host character calls', () => {
 describe('backend user-scope failure handling', () => {
   beforeEach(() => host.reset())
 
-  test('never calls the host with an empty userId; answers scope_unresolved instead', async () => {
+  test('never calls the host with an empty userId; drops silently with a warning', async () => {
     host.deliver({ type: 'characters.list', requestId: 'r7', limit: 5, offset: 0 }, '')
     await flush()
 
-    // Nothing reaches the host: there is no honest id to send.
+    // Nothing reaches the host: there is no honest id to send. The host would
+    // route a reply addressed to "" to the broadcast "system" topic, reaching
+    // every connected client, so no reply is sent at all.
     expect(host.calls).toHaveLength(0)
     expect(host.warnings).toHaveLength(1)
-    expect(host.replies[0]!.payload).toMatchObject({
-      type: 'error',
-      requestId: 'r7',
-      code: 'scope_unresolved',
-      retryable: false,
-    })
+    expect(host.replies).toHaveLength(0)
   })
 
   test('classifies the host operator-scoped error as scope_unresolved, not invalid_input', async () => {
@@ -802,6 +905,132 @@ describe('backend user-scope failure handling', () => {
     await flush()
 
     expect(host.replies[0]!.payload).toMatchObject({ code: 'forbidden', retryable: false })
+  })
+})
+
+describe('backend unsupported request type', () => {
+  beforeEach(() => host.reset())
+
+  test('an unsupported type with an empty envelope userId is logged and dropped, never replied to', async () => {
+    host.deliver({ type: 'lumen.tags.unsupported', requestId: 'u1' }, '')
+    await flush()
+
+    // Same rule as every handled case: an unscoped reply would reach the
+    // broadcast "system" topic and leak to every connected client.
+    expect(host.replies).toHaveLength(0)
+    expect(host.calls).toHaveLength(0)
+    expect(host.warnings).toHaveLength(1)
+  })
+
+  test('an unsupported type with a whitespace-only envelope userId is logged and dropped', async () => {
+    host.deliver({ type: 'lumen.tags.unsupported', requestId: 'u2' }, '   ')
+    await flush()
+
+    expect(host.replies).toHaveLength(0)
+    expect(host.warnings).toHaveLength(1)
+  })
+
+  test('an unsupported type with a valid userId still gets the invalid_input error reply', async () => {
+    host.deliver({ type: 'lumen.tags.unsupported', requestId: 'u3' }, ENVELOPE_USER_ID)
+    await flush()
+
+    expect(host.replies).toHaveLength(1)
+    expect(host.replies[0]!.userId).toBe(ENVELOPE_USER_ID)
+    expect(host.replies[0]!.payload).toMatchObject({
+      type: 'error',
+      requestId: 'u3',
+      code: 'invalid_input',
+      retryable: false,
+    })
+  })
+})
+
+/* -------------------------------------------------------------------------- */
+/* backend: single-character replies ship the slim wire projection             */
+/* -------------------------------------------------------------------------- */
+
+describe('backend single-character replies omit the prompt body', () => {
+  const PROMPT_SENTINEL = 'PROMPT_BODY_SENTINEL'
+  const WIRE_KEYS = ['id', 'name', 'tags', 'image_id', 'created_at', 'updated_at']
+  const PROMPT_FIELDS = ['description', 'personality', 'scenario', 'creator', 'creator_notes', 'system_prompt']
+
+  beforeEach(() => host.reset())
+
+  test('characters.list replies carry only the wire keys for every row', async () => {
+    // The fake host answers list() with full DTOs (fixture carries the prompt
+    // fields), mirroring the host's SELECT *: the backend must slim them.
+    host.deliver({ type: 'characters.list', requestId: 'w1', limit: 10, offset: 0 }, ENVELOPE_USER_ID)
+    await flush()
+
+    const reply = host.replies[0]!.payload as Extract<BackendResponse, { type: 'characters.list.result' }>
+    expect(reply.type).toBe('characters.list.result')
+    expect(reply.data.length).toBeGreaterThan(0)
+    for (const row of reply.data) {
+      expect(Object.keys(row)).toEqual(WIRE_KEYS)
+      for (const promptField of PROMPT_FIELDS) expect(row).not.toHaveProperty(promptField)
+    }
+    expect(JSON.stringify(reply.data)).not.toContain('"description"')
+  })
+
+  test('characters.get replies carry only the wire keys', async () => {
+    host.seed('c9', {
+      id: 'c9',
+      name: 'Aria',
+      description: PROMPT_SENTINEL,
+      personality: PROMPT_SENTINEL,
+      scenario: PROMPT_SENTINEL,
+      creator: PROMPT_SENTINEL,
+      creator_notes: PROMPT_SENTINEL,
+      system_prompt: PROMPT_SENTINEL,
+      tags: ['Elf'],
+      image_id: 'img-9',
+      created_at: 11,
+      updated_at: 22,
+    })
+    host.deliver({ type: 'characters.get', requestId: 'w2', characterId: 'c9' }, ENVELOPE_USER_ID)
+    await flush()
+
+    const reply = host.replies[0]!.payload as Extract<BackendResponse, { type: 'characters.get.result' }>
+    expect(Object.keys(reply.character!)).toEqual(WIRE_KEYS)
+    for (const promptField of PROMPT_FIELDS) expect(reply.character!).not.toHaveProperty(promptField)
+    expect(reply.character).toEqual({
+      id: 'c9',
+      name: 'Aria',
+      tags: ['Elf'],
+      image_id: 'img-9',
+      created_at: 11,
+      updated_at: 22,
+    })
+    expect(JSON.stringify(reply)).not.toContain(PROMPT_SENTINEL)
+  })
+
+  test('characters.updateTags replies carry only the wire keys', async () => {
+    host.seed('c8', {
+      id: 'c8',
+      name: 'Bors',
+      description: PROMPT_SENTINEL,
+      personality: PROMPT_SENTINEL,
+      scenario: PROMPT_SENTINEL,
+      creator: PROMPT_SENTINEL,
+      creator_notes: PROMPT_SENTINEL,
+      system_prompt: PROMPT_SENTINEL,
+      tags: ['Old'],
+      image_id: null,
+      created_at: 33,
+      updated_at: 44,
+    })
+    host.deliver(
+      { type: 'characters.updateTags', requestId: 'w3', characterId: 'c8', tags: ['Elf'] },
+      ENVELOPE_USER_ID,
+    )
+    await flush()
+
+    const reply = host.replies[0]!.payload as Extract<BackendResponse, { type: 'characters.updateTags.result' }>
+    expect(Object.keys(reply.character)).toEqual(WIRE_KEYS)
+    for (const promptField of PROMPT_FIELDS) expect(reply.character).not.toHaveProperty(promptField)
+    expect(reply.character.tags).toEqual(['Elf'])
+    expect(reply.character.created_at).toBe(33)
+    expect(JSON.stringify(reply)).not.toContain(PROMPT_SENTINEL)
   })
 })
 
@@ -981,7 +1210,7 @@ describe('backend characters.updateTagsBatch', () => {
     expect(host.replies[0]!.payload).toMatchObject({ type: 'error', code: 'invalid_input', retryable: false })
   })
 
-  test('no user scope drops the batch without a host call', async () => {
+  test('no user scope drops the batch without a host call or a reply', async () => {
     host.deliver(
       { type: 'characters.updateTagsBatch', requestId: 'b7', updates: [{ characterId: 'c1', tags: ['a'] }] },
       '',
@@ -989,7 +1218,10 @@ describe('backend characters.updateTagsBatch', () => {
     await flush()
 
     expect(host.calls).toHaveLength(0)
-    expect(host.replies[0]!.payload).toMatchObject({ code: 'scope_unresolved', retryable: false })
+    expect(host.warnings).toHaveLength(1)
+    // No reply at all: a reply addressed to "" would be broadcast to every
+    // connected client via the host's "system" topic.
+    expect(host.replies).toHaveLength(0)
   })
 })
 

@@ -423,9 +423,10 @@ export function renderFailurePanel(options: FailurePanelOptions): { destroy(): v
    *
    * The operation is marked busy BEFORE awaiting and unmarked after, so a second
    * click on any other control for the same operation cannot start an
-   * overlapping retry. A retry re-reads the character from the server before it
-   * writes, which is what makes retrying a timed-out write safe — it goes
-   * through the store action, never a replay of a snapshot taken at report time.
+   * overlapping retry. A retry re-reads all targeted characters in ONE batched
+   * getTagsBatch call before it writes, which is what makes retrying a
+   * timed-out write safe — it goes through the store action, never a replay of
+   * a snapshot taken at report time.
    */
   const runRetry = (opId: string, work: () => Promise<void>): void => {
     if (busyOps.has(opId)) return

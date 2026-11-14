@@ -1,4 +1,4 @@
-import { describe, expect, test } from 'bun:test'
+import { describe, expect, spyOn, test } from 'bun:test'
 
 import type { CharacterMutationPort } from '../src/frontend/repository'
 import type { BatchFailure } from '../src/shared/protocol'
@@ -17,6 +17,7 @@ import {
   isFailure,
   isResolved,
   type MutationResult,
+  type MutationState,
   type OperationReport,
 } from '../src/frontend/mutations/report'
 
@@ -66,11 +67,14 @@ class MockPort implements CharacterMutationPort {
   readonly server = new Map<string, LumiTagCharacter>()
   readonly deleted = new Set<string>()
   readonly writes: { id: string; tags: string[] }[] = []
-  readonly gets: string[] = []
+  /** Every batched read, so the retry's round-trip count is assertable. */
+  readonly batchGets: string[][] = []
   /** Every batched write request, so the transport's round-trip count is assertable. */
   readonly batchWrites: { updates: { characterId: string; tags: string[] }[] }[] = []
   /** When set, the NEXT batched write throws instead of answering. */
   batchFails: unknown = null
+  /** When set, every batched read throws — the read-side transport failure. */
+  failBatchGet: unknown = null
   /**
    * Optional rewrite of the assembled reply, standing in for a host whose
    * `updated` entries are LOSSY — one character silently absent, or carried
@@ -84,7 +88,6 @@ class MockPort implements CharacterMutationPort {
       })
     | null = null
   private readonly script: Script = {}
-  private readonly getFailures = new Map<string, unknown>()
   private inFlight = 0
   maxInFlight = 0
   /** Optional gate used to observe concurrency while a call is parked. */
@@ -98,10 +101,6 @@ class MockPort implements CharacterMutationPort {
     this.script[id] = behaviours
   }
 
-  failGet(id: string, error: unknown): void {
-    this.getFailures.set(id, error)
-  }
-
   writesFor(id: string): { id: string; tags: string[] }[] {
     return this.writes.filter((w) => w.id === id)
   }
@@ -111,15 +110,22 @@ class MockPort implements CharacterMutationPort {
   }
 
   async getCharacter(id: string): Promise<LumiTagCharacter | null> {
-    this.gets.push(id)
-    const failure = this.getFailures.get(id)
-    if (failure !== undefined) throw failure
     if (this.deleted.has(id)) return null
     const found = this.server.get(id)
     return found ? { ...found, tags: [...found.tags] } : null
   }
 
   async updateTags(id: string, tags: string[]): Promise<LumiTagCharacter> {
+    return this.performWrite(id, tags)
+  }
+
+  /**
+   * The per-character write engine, shared by the single and batch transports
+   * — the public `updateTags` exists only to prove the executor never reaches
+   * for the single-character path, so the batch path must not route back
+   * through it.
+   */
+  private async performWrite(id: string, tags: string[]): Promise<LumiTagCharacter> {
     this.inFlight += 1
     this.maxInFlight = Math.max(this.maxInFlight, this.inFlight)
     try {
@@ -149,8 +155,13 @@ class MockPort implements CharacterMutationPort {
   }
 
   async getTagsBatch(ids: readonly string[]): Promise<Map<string, CharacterTags>> {
+    this.batchGets.push([...ids])
+    if (this.failBatchGet !== null) throw this.failBatchGet
     const out = new Map<string, CharacterTags>()
     for (const id of ids) {
+      // A deleted (or otherwise unreadable) character is simply ABSENT from
+      // the map — the honest reading of a read that did not happen.
+      if (this.deleted.has(id)) continue
       const found = this.server.get(id)
       if (found) out.set(id, { id, tags: [...found.tags] })
     }
@@ -171,7 +182,7 @@ class MockPort implements CharacterMutationPort {
     const failures: BatchFailure[] = []
     for (const update of updates) {
       try {
-        const written = await this.updateTags(update.characterId, update.tags)
+        const written = await this.performWrite(update.characterId, update.tags)
         updated.push({ id: written.id, tags: [...written.tags] })
       } catch (error) {
         const classified = classifyError(error)
@@ -392,8 +403,8 @@ describe('4. a retry succeeds', () => {
     expect(result.error).toBeUndefined()
     expect(retried.status).toBe('succeeded')
     expect(port.tagsOf('c1')).toEqual(['Elf'])
-    // A safe retry re-reads before it writes.
-    expect(port.gets).toEqual(['c1'])
+    // A safe retry re-reads before it writes — in one batched read.
+    expect(port.batchGets).toEqual([['c1']])
     assertTotalsConsistent(retried)
   })
 })
@@ -567,7 +578,7 @@ describe('8. a character changes between the original attempt and the retry', ()
 // ---------------------------------------------------------------------------
 
 describe('9. the character is deleted or inaccessible', () => {
-  test('getCharacter null → conflict, not retryable, no write attempted', async () => {
+  test('a character missing from the batch re-read → conflict, not retryable, no write attempted', async () => {
     const port = new MockPort()
     port.seed('c1', 'A', [])
     port.scriptWrites('c1', [{ kind: 'error', error: new Error('boom') }])
@@ -582,22 +593,38 @@ describe('9. the character is deleted or inaccessible', () => {
     const result = retried.results[0] as MutationResult
     expect(result.state).toBe('conflict')
     expect(result.retryable).toBe(false)
-    expect(result.error?.message).toMatch(/no longer accessible/i)
+    expect(result.uncertain).toBe(false)
+    // Byte-identical to the old null-record path.
+    expect(result.error?.message).toBe(
+      'This character is no longer accessible — it may have been deleted, so nothing was changed.',
+    )
+    expect(result.error?.code).toBe('not_found')
+    expect(result.committedTags).toBeUndefined()
     expect(port.writes.length).toBe(before)
     assertTotalsConsistent(retried)
   })
 
-  test('a throwing getCharacter is reported as a failure, not a silent success', async () => {
+  test('a throwing batch re-read is reported as a failure on every targeted mutation', async () => {
     const port = new MockPort()
     port.seed('c1', 'A', [])
+    port.seed('c2', 'B', [])
     port.scriptWrites('c1', [{ kind: 'error', error: new Error('boom') }])
+    port.scriptWrites('c2', [{ kind: 'error', error: new Error('boom') }])
     const executor = new MutationExecutor(port)
     const first = await executor.execute(
-      previewOf([planMutation({ characterId: 'c1', addedTags: ['Elf'] })]),
+      previewOf([
+        planMutation({ characterId: 'c1', addedTags: ['Elf'] }),
+        planMutation({ characterId: 'c2', addedTags: ['Elf'] }),
+      ]),
     )
-    port.failGet('c1', new Error('backend unavailable'))
-    const retried = await executor.retryOne(first, first.results[0]!.mutationId)
-    expect((retried.results[0] as MutationResult).state).toBe('failed')
+    port.failBatchGet = new Error('backend unavailable')
+    const retried = await executor.retryAll(first)
+    for (const result of retried.results) {
+      expect((result as MutationResult).state).toBe('failed')
+    }
+    // Nothing was written: the read never happened, so no write may be attempted.
+    expect(port.batchWrites).toHaveLength(1) // the failed execute attempt only
+    assertTotalsConsistent(retried)
   })
 
   test('a conflict cannot be retried into a write', async () => {
@@ -820,8 +847,12 @@ describe('13. duplicate retries cannot create duplicate assignments', () => {
     release()
     const [ra, rb] = await Promise.all([a, b])
 
-    // Bounded: at most one extra write for the retry (the other is skipped).
-    expect(port.writes.length).toBeLessThanOrEqual(2)
+    // Exactly one extra write for the retry (the other is adopted, not
+    // attached to a second attempt).
+    expect(port.writes.length).toBe(2)
+    expect(port.batchWrites).toHaveLength(2)
+    // Exactly ONE re-read hit the transport; the adoptee never re-read.
+    expect(port.batchGets).toEqual([['c1']])
     const finalTags = port.tagsOf('c1')
     expect(finalTags).toEqual(['Elf'])
     expect(new Set(finalTags).size).toBe(finalTags.length)
@@ -1586,7 +1617,7 @@ describe('empty preview', () => {
     expect(report.status).toBe('succeeded')
     expect(report.totals).toEqual({ total: 0, succeeded: 0, failed: 0, remaining: 0 })
     expect(port.writes).toHaveLength(0)
-    expect(port.gets).toHaveLength(0)
+    expect(port.batchGets).toHaveLength(0)
     const again = await executor.retryAll(report)
     expect(again.status).toBe('succeeded')
     expect(port.writes).toHaveLength(0)
@@ -1779,3 +1810,517 @@ describe('returned reports are independent snapshots', () => {
 })
 
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// committedTags on verified outcomes
+// ---------------------------------------------------------------------------
+
+describe('committedTags on verified outcomes', () => {
+  test('results verified by the batch reply carry exactly the reply tags', async () => {
+    const port = new MockPort()
+    port.seed('c1', 'A', ['Existing'])
+    port.seed('c2', 'B', [])
+    const executor = new MutationExecutor(port)
+
+    const report = await executor.execute(
+      previewOf([
+        planMutation({ characterId: 'c1', current: ['Existing'], addedTags: ['Elf'] }),
+        planMutation({ characterId: 'c2', current: [], addedTags: ['Elf'] }),
+      ]),
+    )
+
+    expect(report.status).toBe('succeeded')
+    for (const r of report.results) {
+      expect(r.state).toBe('succeeded')
+      expect(r.committedTags).toEqual([...port.server.get(r.characterId)!.tags])
+    }
+  })
+
+  test('a verification failure carries NO committedTags', async () => {
+    const port = new MockPort()
+    port.seed('c1', 'A', [])
+    // The write "succeeds" but silently drops the tags: nothing the host
+    // confirmed may be claimed as committed.
+    port.scriptWrites('c1', [{ kind: 'silent-noop' }])
+    const executor = new MutationExecutor(port)
+
+    const report = await executor.execute(previewOf([planMutation({ characterId: 'c1', addedTags: ['Elf'] })]))
+
+    expect(report.results[0]?.state).toBe('failed')
+    expect(report.results[0]?.committedTags).toBeUndefined()
+  })
+
+  test('a character the host never mentions carries NO committedTags', async () => {
+    const port = new MockPort()
+    port.seed('c1', 'A', [])
+    port.seed('c2', 'B', [])
+    // The write landed server-side, but the host's reply dropped c1 entirely.
+    port.batchReplyHook = (reply) => ({
+      ...reply,
+      updated: reply.updated.filter((u) => u.id !== 'c1'),
+    })
+    const executor = new MutationExecutor(port)
+
+    const report = await executor.execute(
+      previewOf([
+        planMutation({ characterId: 'c1', current: [], addedTags: ['Elf'] }),
+        planMutation({ characterId: 'c2', current: [], addedTags: ['Elf'] }),
+      ]),
+    )
+
+    const c1 = report.results.find((r) => r.characterId === 'c1')
+    const c2 = report.results.find((r) => r.characterId === 'c2')
+    expect(c1?.uncertain).toBe(true)
+    expect(c1?.committedTags).toBeUndefined()
+    expect(c2?.state).toBe('succeeded')
+    expect(c2?.committedTags).toEqual(['Elf'])
+  })
+
+  test('a fully-resolved retry carries committedTags echoed by the host', async () => {
+    const port = new MockPort()
+    port.seed('c1', 'A', [])
+    // First attempt dies at the transport; retry re-reads (sees nothing) and
+    // writes successfully against the current record.
+    port.scriptWrites('c1', [{ kind: 'error', error: timeoutError() }])
+    const executor = new MutationExecutor(port)
+
+    const first = await executor.execute(previewOf([planMutation({ characterId: 'c1', current: [], addedTags: ['Elf'] })]))
+    const failed = first.results[0]!
+    expect(failed.state).toBe('failed')
+    expect(failed.committedTags).toBeUndefined()
+
+    const report = await executor.retryOne(first, failed.mutationId)
+    expect(report.status).toBe('succeeded')
+    expect(report.results[0]?.state).toBe('resolved_on_retry')
+    expect(report.results[0]?.committedTags).toEqual(['Elf'])
+  })
+
+  test('a retry that finds the change already applied carries committedTags from the re-read', async () => {
+    const port = new MockPort()
+    port.seed('c1', 'A', [])
+    // apply-then-error: the write lands, the response is lost.
+    port.scriptWrites('c1', [{ kind: 'apply-then-error', error: timeoutError() }])
+    const executor = new MutationExecutor(port)
+
+    const first = await executor.execute(previewOf([planMutation({ characterId: 'c1', current: [], addedTags: ['Elf'] })]))
+    expect(first.results[0]?.state).toBe('failed')
+    expect(first.results[0]?.uncertain).toBe(true)
+    expect(first.results[0]?.committedTags).toBeUndefined()
+
+    const report = await executor.retryOne(first, first.results[0]!.mutationId)
+    expect(report.results[0]?.state).toBe('resolved_on_retry')
+    // Verified against the host's re-read of the record — the write itself was
+    // never re-applied.
+    expect(report.results[0]?.committedTags).toEqual(['Elf'])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Batched retry transport (W2.3)
+//
+// `retryAll`/`retryGroup`/`retryOne` no longer pay 2N round trips over N
+// failures: ONE `getTagsBatch` re-reads every failed character and ONE
+// `updateTagsBatch` carries whatever still needs to land — the same two
+// batched transports `execute()` uses.
+// ---------------------------------------------------------------------------
+
+describe('batched retry transport', () => {
+  test('(a) retryAll on N failures issues exactly one batched read and one batched write', async () => {
+    const port = new MockPort()
+    const ids = Array.from({ length: 5 }, (_, i) => `c${i}`)
+    for (const id of ids) {
+      port.seed(id, id, [])
+      port.scriptWrites(id, [{ kind: 'error', error: new Error('boom') }])
+    }
+    const executor = new MutationExecutor(port)
+    const report = await executor.execute(
+      previewOf(ids.map((characterId) => planMutation({ characterId, addedTags: ['Elf'] }))),
+    )
+    expect(report.totals.remaining).toBe(5)
+
+    const getCharacterSpy = spyOn(port, 'getCharacter')
+    const updateTagsSpy = spyOn(port, 'updateTags')
+    const batchGetsBefore = port.batchGets.length
+    const batchWritesBefore = port.batchWrites.length
+
+    const retried = await executor.retryAll(report)
+
+    // Exactly ONE batched read, carrying every failed character.
+    expect(port.batchGets.length).toBe(batchGetsBefore + 1)
+    expect([...(port.batchGets.at(-1) ?? [])].sort()).toEqual([...ids].sort())
+    // Exactly ONE batched write, carrying every outstanding change.
+    expect(port.batchWrites.length).toBe(batchWritesBefore + 1)
+    expect(port.batchWrites.at(-1)?.updates.map((u) => u.characterId).sort()).toEqual([...ids].sort())
+    // And the single-character transports were never reached.
+    expect(getCharacterSpy).not.toHaveBeenCalled()
+    expect(updateTagsSpy).not.toHaveBeenCalled()
+    getCharacterSpy.mockRestore()
+    updateTagsSpy.mockRestore()
+
+    expect(retried.totals.remaining).toBe(0)
+    expect(retried.results.every((r) => r.state === 'resolved_on_retry')).toBe(true)
+    assertTotalsConsistent(retried)
+  })
+
+  test('(c) every intent already satisfied → batched read happens, but no write is sent', async () => {
+    const port = new MockPort()
+    port.seed('c1', 'A', [])
+    port.seed('c2', 'B', [])
+    port.scriptWrites('c1', [{ kind: 'error', error: new Error('boom') }])
+    port.scriptWrites('c2', [{ kind: 'error', error: new Error('boom') }])
+    const executor = new MutationExecutor(port)
+    const report = await executor.execute(
+      previewOf([
+        planMutation({ characterId: 'c1', addedTags: ['Elf'] }),
+        planMutation({ characterId: 'c2', addedTags: ['Elf'] }),
+      ]),
+    )
+    // Apply the tags out-of-band, as an ambiguous timeout landing would.
+    port.server.set('c1', character('c1', 'A', ['Elf']))
+    port.server.set('c2', character('c2', 'B', ['Elf']))
+    const batchWritesBefore = port.batchWrites.length
+
+    const retried = await executor.retryAll(report)
+
+    expect(port.batchGets).toEqual([['c1', 'c2']])
+    // No write anywhere: the fold resolved every intent.
+    expect(port.batchWrites.length).toBe(batchWritesBefore)
+    expect(retried.results.every((r) => r.state === 'resolved_on_retry')).toBe(true)
+    for (const r of retried.results) expect(r.committedTags).toEqual(['Elf'])
+    expect(retried.status).toBe('succeeded')
+    assertTotalsConsistent(retried)
+  })
+
+  test('(d) a partially-satisfying fold writes once with the folded tags and both mutations verify', async () => {
+    const port = new MockPort()
+    port.seed('c1', 'A', [])
+    // ONE failing write for both mutations (per-item failure fails both).
+    port.scriptWrites('c1', [{ kind: 'error', error: new Error('boom') }])
+    const executor = new MutationExecutor(port)
+    const report = await executor.execute(
+      previewOf([
+        planMutation({ characterId: 'c1', tag: 'Elf', addedTags: ['Elf'], targetTags: ['Elf', 'Dark'] }),
+        planMutation({ characterId: 'c1', tag: 'Dark', addedTags: ['Dark'], targetTags: ['Elf', 'Dark'] }),
+      ]),
+    )
+    expect(report.totals.remaining).toBe(2)
+    // Someone applied JUST the first change out-of-band.
+    port.server.set('c1', character('c1', 'A', ['Elf']))
+    const batchWritesBefore = port.batchWrites.length
+
+    const retried = await executor.retryAll(report)
+
+    // Exactly one batched write, carrying the FOLD of the outstanding intent
+    // over the freshly read tags — not a replay of the planned targetTags.
+    expect(port.batchWrites.length).toBe(batchWritesBefore + 1)
+    expect(port.batchWrites.at(-1)?.updates).toEqual([{ characterId: 'c1', tags: ['Elf', 'Dark'] }])
+
+    const [m1, m2] = retried.results
+    expect(m1?.state).toBe('resolved_on_retry')
+    // Resolved inside the fold: committed at fold time, WITHOUT Dark.
+    expect(m1?.committedTags).toEqual(['Elf'])
+    expect(m2?.state).toBe('resolved_on_retry')
+    // Resolved after the write: committed against the host's post-UPDATE row.
+    expect(m2?.committedTags).toEqual(['Elf', 'Dark'])
+    assertTotalsConsistent(retried)
+  })
+
+  test('(e) a per-item failure fails only that character’s outstanding mutations; siblings resolve', async () => {
+    const port = new MockPort()
+    port.seed('c1', 'A', [])
+    port.seed('c2', 'B', [])
+    port.scriptWrites('c1', [{ kind: 'error', error: new Error('boom') }])
+    port.scriptWrites('c2', [
+      { kind: 'error', error: new Error('boom') },
+      { kind: 'error', error: new Error('write rejected') },
+    ])
+    const executor = new MutationExecutor(port)
+    const report = await executor.execute(
+      previewOf([
+        planMutation({ characterId: 'c1', tag: 'Elf', addedTags: ['Elf'], targetTags: ['Elf', 'Dark'] }),
+        planMutation({ characterId: 'c1', tag: 'Dark', addedTags: ['Dark'], targetTags: ['Elf', 'Dark'] }),
+        planMutation({ characterId: 'c2', addedTags: ['Mage'] }),
+      ]),
+    )
+    expect(report.totals.remaining).toBe(3)
+    // c1: one of its two changes landed out-of-band.
+    port.server.set('c1', character('c1', 'A', ['Elf']))
+    const batchWritesBefore = port.batchWrites.length
+
+    const retried = await executor.retryAll(report)
+
+    // ONE batched write covering both characters' outstanding changes.
+    expect(port.batchWrites.length).toBe(batchWritesBefore + 1)
+    expect(port.batchWrites.at(-1)?.updates).toEqual([
+      { characterId: 'c1', tags: ['Elf', 'Dark'] },
+      { characterId: 'c2', tags: ['Mage'] },
+    ])
+
+    const c1Elf = retried.results.find((r) => r.characterId === 'c1' && r.tag === 'Elf')
+    const c1Dark = retried.results.find((r) => r.characterId === 'c1' && r.tag === 'Dark')
+    const c2Mage = retried.results.find((r) => r.characterId === 'c2')
+
+    // The sibling on the failed character that was ALREADY satisfied in the
+    // fold keeps its outcome; the one that needed the write verified.
+    expect(c1Elf?.state).toBe('resolved_on_retry')
+    expect(c1Elf?.committedTags).toEqual(['Elf'])
+    expect(c1Dark?.state).toBe('resolved_on_retry')
+    expect(c1Dark?.committedTags).toEqual(['Elf', 'Dark'])
+
+    // The per-item failure: failed, retryable, house error, NO echo.
+    expect(c2Mage?.state).toBe('failed')
+    expect(c2Mage?.retryable).toBe(true)
+    expect(c2Mage?.uncertain).toBe(false)
+    expect(c2Mage?.error?.message).toBe('write rejected')
+    expect(c2Mage?.committedTags).toBeUndefined()
+    assertTotalsConsistent(retried)
+  })
+
+  test('(e2) a whole-request failure on the retry keeps fold-resolved mutations intact', async () => {
+    const port = new MockPort()
+    port.seed('c1', 'A', [])
+    port.seed('c2', 'B', [])
+    port.scriptWrites('c1', [{ kind: 'error', error: new Error('boom') }])
+    port.scriptWrites('c2', [{ kind: 'error', error: new Error('boom') }])
+    const executor = new MutationExecutor(port)
+    const report = await executor.execute(
+      previewOf([
+        planMutation({ characterId: 'c1', addedTags: ['Elf'] }),
+        planMutation({ characterId: 'c2', addedTags: ['Mage'] }),
+      ]),
+    )
+    // c1 is already satisfied (its change landed out-of-band); c2 is not.
+    port.server.set('c1', character('c1', 'A', ['Elf']))
+    port.batchFails = timeoutError()
+
+    const retried = await executor.retryAll(report)
+
+    const c1 = retried.results.find((r) => r.characterId === 'c1')
+    const c2 = retried.results.find((r) => r.characterId === 'c2')
+    // The fold-resolved sibling is untouched by the transport failure.
+    expect(c1?.state).toBe('resolved_on_retry')
+    expect(c1?.committedTags).toEqual(['Elf'])
+    // The mutation that actually needed the write failed with the timeout.
+    expect(c2?.state).toBe('failed')
+    expect(c2?.error?.code).toBe('timeout')
+    expect(c2?.uncertain).toBe(true)
+    expect(c2?.committedTags).toBeUndefined()
+    assertTotalsConsistent(retried)
+  })
+
+  test('(g) rename/merge ambiguity mid-fold → conflict with the byte-identical message, sibling still writes', async () => {
+    const port = new MockPort()
+    port.seed('c1', 'A', ['Mage', 'Fire'])
+    // Both mutations' first (and only) write fails.
+    port.scriptWrites('c1', [{ kind: 'error', error: new Error('boom') }])
+    const executor = new MutationExecutor(port)
+    const report = await executor.execute(
+      previewOf(
+        [
+          planMutation({
+            characterId: 'c1',
+            op: 'rename',
+            tag: 'Mage',
+            destTag: 'Magic',
+            addedTags: ['Magic'],
+            removedTags: ['Mage'],
+            current: ['Mage', 'Fire'],
+            targetTags: ['Fire', 'Magic', 'Dark'],
+          }),
+          planMutation({
+            characterId: 'c1',
+            tag: 'Dark',
+            addedTags: ['Dark'],
+            current: ['Mage', 'Fire'],
+            targetTags: ['Fire', 'Magic', 'Dark'],
+          }),
+        ],
+        'rename',
+      ),
+    )
+    expect(report.totals.remaining).toBe(2)
+    // Mage and Magic are BOTH gone by the time the retry runs: the rename
+    // cannot know whether to resurrect the source or add the destination.
+    port.server.set('c1', character('c1', 'A', ['Fire']))
+
+    const retried = await executor.retryAll(report)
+
+    const rename = retried.results.find((r) => r.op === 'rename')
+    const add = retried.results.find((r) => r.tag === 'Dark')
+    // Byte-identical to the single-character rename path's message.
+    expect(rename?.state).toBe('conflict')
+    expect(rename?.retryable).toBe(false)
+    expect(rename?.uncertain).toBe(false)
+    expect(rename?.committedTags).toBeUndefined()
+    expect(rename?.error).toEqual({
+      message:
+        '"Mage" is already gone and "Magic" is missing, so this change cannot be applied automatically.',
+      code: 'conflict',
+    })
+    // The sibling mutation folded AFTER the conflict and still wrote, with
+    // only its own intent applied — the conflict did not poison the batch.
+    expect(add?.state).toBe('resolved_on_retry')
+    expect(port.tagsOf('c1').sort()).toEqual(['Dark', 'Fire'])
+    expect(port.batchWrites.at(-1)?.updates).toEqual([{ characterId: 'c1', tags: ['Fire', 'Dark'] }])
+    assertTotalsConsistent(retried)
+  })
+
+  test('batched retry yields the same per-mutation outcomes the per-character retry produced', async () => {
+    // Shared fixture: one failing operation report covering FOUR failed
+    // mutations across FOUR characters, one mutation each:
+    //
+    //   c1 — the write landed before the response was lost (the ambiguous
+    //        timeout), so the retry must recognise the intent as already
+    //        satisfied and write NOTHING.
+    //   c2 — rejects the retry's write per item, which must flow through
+    //        classifyBatchFailure → markFailure verbatim.
+    //   c3 — is absent from the batched re-read (deleted out-of-band), which
+    //        must land in the not_found conflict branch.
+    //   c4 — re-reads empty and writes successfully, ending resolved_on_retry
+    //        against the host's post-UPDATE echo.
+    const port = new MockPort()
+    port.seed('c1', 'Already-applied', [])
+    port.seed('c2', 'Per-item failure', [])
+    port.seed('c3', 'Missing from read', [])
+    port.seed('c4', 'Clean verify', [])
+    port.scriptWrites('c1', [{ kind: 'apply-then-error', error: timeoutError() }])
+    port.scriptWrites('c2', [
+      { kind: 'error', error: new Error('boom') },
+      { kind: 'error', error: Object.assign(new Error('the host rejected the write'), { code: 'rate_limited' }) },
+    ])
+    port.scriptWrites('c3', [{ kind: 'error', error: new Error('boom') }])
+    port.scriptWrites('c4', [{ kind: 'error', error: new Error('boom') }])
+
+    const executor = new MutationExecutor(port)
+    const first = await executor.execute(
+      previewOf([
+        planMutation({ characterId: 'c1', characterName: 'Already-applied', tag: 'Elf', addedTags: ['Elf'] }),
+        planMutation({ characterId: 'c2', characterName: 'Per-item failure', tag: 'Mage', addedTags: ['Mage'] }),
+        planMutation({ characterId: 'c3', characterName: 'Missing from read', tag: 'Dark', addedTags: ['Dark'] }),
+        planMutation({ characterId: 'c4', characterName: 'Clean verify', tag: 'Wand', addedTags: ['Wand'] }),
+      ]),
+    )
+    // The fixture really is a failing report: every mutation failed once.
+    expect(first.results.map((r) => r.state)).toEqual(['failed', 'failed', 'failed', 'failed'])
+    const attemptsBefore = new Map(first.results.map((r) => [r.mutationId, r.attempts]))
+
+    // c3 is deleted out-of-band before the retry runs.
+    port.deleted.add('c3')
+    const batchGetsBefore = port.batchGets.length
+    const batchWritesBefore = port.batchWrites.length
+
+    const retried = await executor.retryAll(first)
+
+    // Same mutation set, same ids — the retry invents no work and drops none.
+    expect(retried.results.map((r) => r.mutationId)).toEqual(first.results.map((r) => r.mutationId))
+
+    // ONE batched read carrying exactly the failed set…
+    expect(port.batchGets.length).toBe(batchGetsBefore + 1)
+    expect(port.batchGets.at(-1)).toEqual(['c1', 'c2', 'c3', 'c4'])
+    // …and ONE batched write covering ONLY what still needed writing: c1
+    // already satisfied (no write), c3 unreadable (nothing written).
+    expect(port.batchWrites.length).toBe(batchWritesBefore + 1)
+    const retryWrites = port.batchWrites.at(-1)!.updates
+    expect(retryWrites).toEqual([
+      { characterId: 'c2', tags: ['Mage'] },
+      { characterId: 'c4', tags: ['Wand'] },
+    ])
+
+    // The full per-mutation outcome table (state, attempts delta, retryable,
+    // uncertain, error.code) — exactly what the per-character retry produced.
+    const byCharacter = new Map(retried.results.map((r) => [r.characterId, r]))
+    const expected: Record<string, { state: MutationState; retryable: boolean; uncertain: boolean; code?: string }> = {
+      c1: { state: 'resolved_on_retry', retryable: false, uncertain: false },
+      c2: { state: 'failed', retryable: true, uncertain: false, code: 'rate_limited' },
+      c3: { state: 'conflict', retryable: false, uncertain: false, code: 'not_found' },
+      c4: { state: 'resolved_on_retry', retryable: false, uncertain: false },
+    }
+    for (const [characterId, want] of Object.entries(expected)) {
+      const result = byCharacter.get(characterId)
+      expect(result?.state).toBe(want.state)
+      expect(result?.retryable).toBe(want.retryable)
+      expect(result?.uncertain).toBe(want.uncertain)
+      expect(result?.error?.code).toBe(want.code)
+      // Every mutation went through exactly one more attempt than before.
+      expect(result?.attempts).toBe((attemptsBefore.get(result!.mutationId) ?? 0) + 1)
+    }
+    // Resolved outcomes carry no error at all; unverified/failed ones carry no
+    // committedTags — nothing unvouched-for is claimed as committed.
+    expect(byCharacter.get('c1')?.error).toBeUndefined()
+    expect(byCharacter.get('c4')?.error).toBeUndefined()
+    expect(byCharacter.get('c1')?.committedTags).toEqual(['Elf'])
+    expect(byCharacter.get('c2')?.committedTags).toBeUndefined()
+    expect(byCharacter.get('c3')?.committedTags).toBeUndefined()
+    expect(byCharacter.get('c4')?.committedTags).toEqual(['Wand'])
+
+    // The whole report derives to exactly the expected totals/status.
+    expect(retried.totals).toEqual(computeTotals(retried.results))
+    expect(retried.status).toBe(deriveStatus(retried.results, false))
+    expect(retried.totals).toEqual({ total: 4, succeeded: 2, failed: 2, remaining: 2 })
+    expect(retried.status).toBe('partially_completed')
+    assertTotalsConsistent(retried)
+  })
+
+  test('a character absent from both halves of the retry write reply fails every unsatisfied mutation (retryable, uncertain, code unverified); a reported sibling verifies', async () => {
+    const port = new MockPort()
+    port.seed('c1', 'Ghosted', [])
+    port.seed('c2', 'Reported', [])
+    port.scriptWrites('c1', [{ kind: 'error', error: new Error('boom') }])
+    port.scriptWrites('c2', [{ kind: 'error', error: new Error('boom') }])
+
+    const executor = new MutationExecutor(port)
+    const first = await executor.execute(
+      previewOf([
+        planMutation({ characterId: 'c1', characterName: 'Ghosted', tag: 'Elf', addedTags: ['Elf'], targetTags: ['Elf', 'Dark'] }),
+        planMutation({ characterId: 'c1', characterName: 'Ghosted', tag: 'Dark', addedTags: ['Dark'], targetTags: ['Elf', 'Dark'] }),
+        planMutation({ characterId: 'c2', characterName: 'Reported', tag: 'Mage', addedTags: ['Mage'] }),
+      ]),
+    )
+    expect(first.results.map((r) => r.state)).toEqual(['failed', 'failed', 'failed'])
+
+    // The retry's write lands server-side, but the host's reply drops c1
+    // ENTIRELY — not in `updated`, not in `failures`.
+    port.batchReplyHook = (reply) => ({
+      ...reply,
+      updated: reply.updated.filter((u) => u.id !== 'c1'),
+      failures: reply.failures.filter((f) => f.characterId !== 'c1'),
+    })
+    const batchWritesBefore = port.batchWrites.length
+
+    const retried = await executor.retryAll(first)
+
+    // ONE batched write, and it really did carry both characters.
+    expect(port.batchWrites.length).toBe(batchWritesBefore + 1)
+    expect(port.batchWrites.at(-1)?.updates).toEqual([
+      { characterId: 'c1', tags: ['Elf', 'Dark'] },
+      { characterId: 'c2', tags: ['Mage'] },
+    ])
+
+    // Every unsatisfied mutation of the ghosted character fails with the
+    // missing-reply semantics: retryable, uncertain, code unverified, and no
+    // committedTags may be claimed.
+    const ghosted = retried.results.filter((r) => r.characterId === 'c1')
+    expect(ghosted).toHaveLength(2)
+    for (const mutation of ghosted) {
+      expect(mutation.state).toBe('failed')
+      expect(mutation.retryable).toBe(true)
+      expect(mutation.uncertain).toBe(true)
+      expect(mutation.error?.code).toBe('unverified')
+      expect(mutation.committedTags).toBeUndefined()
+      expect(mutation.attempts).toBe(2)
+    }
+
+    // The sibling the host fully reported verifies against its post-UPDATE row.
+    const sibling = retried.results.find((r) => r.characterId === 'c2')
+    expect(sibling?.state).toBe('resolved_on_retry')
+    expect(sibling?.retryable).toBe(false)
+    expect(sibling?.uncertain).toBe(false)
+    expect(sibling?.error).toBeUndefined()
+    expect(sibling?.committedTags).toEqual(['Mage'])
+    expect(sibling?.attempts).toBe(2)
+
+    expect(retried.totals).toEqual({ total: 3, succeeded: 1, failed: 2, remaining: 2 })
+    expect(retried.status).toBe('partially_completed')
+    assertTotalsConsistent(retried)
+  })
+})

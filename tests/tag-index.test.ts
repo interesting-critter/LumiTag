@@ -274,4 +274,22 @@ describe('updateTagIndex', () => {
     expect(updateTagIndex(before, new Map())).toBe(before)
     expect(updateTagIndex(before, new Map([['missing', { tags: ['New'] }]]))).toBe(before)
   })
+
+  test('returns the SAME index object when refreshed values are identical to current', () => {
+    const before = buildTagIndex([
+      character('c1', 'Ayla', ['Elf', 'Magic']),
+      character('c2', 'Bran', ['Elf', 'Warrior']),
+      character('c3', 'Cira', ['Magic', 'Rogue']),
+    ])
+    // Same spellings, same order, for a subset and for every id.
+    expect(updateTagIndex(before, new Map([['c1', { tags: ['Elf', 'Magic'] }]]))).toBe(before)
+    expect(updateTagIndex(before, new Map([
+      ['c1', { tags: ['Elf', 'Magic'] }],
+      ['c2', { tags: ['Elf', 'Warrior'] }],
+      ['c3', { tags: ['Magic', 'Rogue'] }],
+    ]))).toBe(before)
+    // Identical after normalization (trim, case-insensitive dedupe keeping the
+    // first spelling): no entry may change, so the object is returned untouched.
+    expect(updateTagIndex(before, new Map([['c1', { tags: ['  Elf  ', 'Magic', 'elf'] }]]))).toBe(before)
+  })
 })
