@@ -116,7 +116,7 @@ function isWellFormedFor(response: Record<string, unknown>, expectedType: Backen
     case 'characters.get.result':
       return response.type === 'characters.get.result' && 'character' in response
     case 'characters.updateTags.result':
-      return response.type === 'characters.updateTags.result' && response.character !== null
+      return response.type === 'characters.updateTags.result' && isRecord(response.character)
     case 'characters.updateTagsBatch.result':
       return (
         response.type === 'characters.updateTagsBatch.result' &&

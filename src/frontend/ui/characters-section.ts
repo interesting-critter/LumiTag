@@ -73,6 +73,7 @@ import {
   pageCountFor,
 } from '../store'
 import { tagKey } from '../tag-index'
+import { characterAvatarUrl } from '../repository'
 import { parseCountFilter } from '../count-filter'
 import { requestDialog } from './dialog-host'
 import {
@@ -259,11 +260,6 @@ let pickerTimer: ReturnType<typeof setTimeout> | null = null
  */
 function pickerDefaultOpen(selectedCount: number, query: string): boolean {
   return selectedCount > 0 || query.trim() !== ''
-}
-
-/** Session-authenticated, read-only avatar endpoint for a character. */
-function avatarUrl(id: string): string {
-  return `/api/v1/characters/${encodeURIComponent(id)}/avatar`
 }
 
 /** A short, human-scannable form of a character id. */
@@ -1073,7 +1069,7 @@ export function renderCharactersSection(options: {
         store.actions.toggleCharacterSelected(id, checked),
       ),
     )
-    node.appendChild(avatar(avatarUrl(id), name, 28))
+    node.appendChild(avatar(characterAvatarUrl(id), name, 28))
 
     const main = el('div', { class: 'lt-character-row__main' })
     const title = el('div', { class: 'lt-character-row__title' })
@@ -1242,10 +1238,10 @@ export function renderCharactersSection(options: {
 
     const selectAll = button('Select All (matching characters)', {
       title:
-        'Select every character matching your current search, sort and filters, across ALL pages — ' +
-        'not every character in your library. Tags ticked on an earlier page stay ticked.',
+        'Select every character matching your current search, sort and filters, across ALL pages ' +
+        '(with no filters this is your whole library). Tags ticked on an earlier page stay ticked.',
       ariaLabel:
-        'Select all characters matching the current search across every page, not the whole library',
+        'Select every character matching your current search, sort and filters, across all pages (with no filters this is your whole library)',
       onClick: () => store.actions.selectAllVisibleCharacters(),
     })
     setDisabled(selectAll, view.characterRows.length === 0)

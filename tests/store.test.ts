@@ -59,6 +59,13 @@ class FakeRepository {
   readonly writeScript = new Map<string, WriteBehaviour[]>()
   /** Ids the backend cannot read back, so they are dropped from a batch read. */
   readonly hiddenFromBatchReads = new Set<string>()
+  /**
+   * Ids the host DROPS from a batch write's reply entirely — neither
+   * `updated` nor `failures`. The write may well have landed, but the reply
+   * carries no evidence either way, which is exactly the `unverified`
+   * (uncertain) outcome the real backend can produce.
+   */
+  readonly droppedFromBatchWrites = new Set<string>()
   /** Every batched read, so "only the affected ids" is assertable. */
   readonly batchGets: string[][] = []
   /** Every batched write request, so "one round trip per operation" is assertable. */
@@ -152,8 +159,14 @@ class FakeRepository {
     for (const update of updates) {
       try {
         const written = await this.updateTags(update.characterId, update.tags)
+        // The write landed, but the character vanishes from BOTH halves of the
+        // reply — neither `updated` nor `failures`. Nothing may be concluded
+        // about it, which is exactly the `unverified` outcome the real
+        // backend can produce.
+        if (this.droppedFromBatchWrites.has(update.characterId)) continue
         updated.push({ id: written.id, tags: [...written.tags] })
       } catch (error) {
+        if (this.droppedFromBatchWrites.has(update.characterId)) continue
         const classified = classifyError(error)
         failures.push({
           characterId: update.characterId,
@@ -429,6 +442,22 @@ describe('store character query and sorting', () => {
       store.actions.setCharacterSort(mode as CharacterSortMode)
       expect(names(store.view)).toEqual(order)
     }
+  })
+
+  test('has_tags_first orders by tag count descending, then name ascending', async () => {
+    // Name order deliberately contradicts count order, so a name-only comparator
+    // cannot pass this.
+    const fake = new FakeRepository()
+    fake.seed('n1', 'Alpha', ['x'])
+    fake.seed('n2', 'Bravo', ['y', 'z'])
+    fake.seed('n3', 'Charlie', ['a', 'b', 'c'])
+    // Ties on count fall back to ascending name.
+    fake.seed('n4', 'Delta', ['p', 'q'])
+    const store = makeStore(fake)
+    await store.load()
+
+    store.actions.setCharacterSort('has_tags_first')
+    expect(names(store.view)).toEqual(['Charlie', 'Bravo', 'Delta', 'Alpha'])
   })
 
   test('ties break on character name so ordering is deterministic', async () => {
@@ -959,7 +988,7 @@ describe('store.runBulkUnassign', () => {
     expect(fake.server.get('c1')?.tags).toEqual(['Elf', 'Magic', 'Knight'])
   })
 
-  test('costs ONE batched write and ONE batched read, like any bulk edit', async () => {
+  test('costs ONE batched write and NO batched read on full success — the write echo is the confirmation', async () => {
     const fake = seeded()
     const store = makeStore(fake)
     await store.load()
@@ -970,7 +999,12 @@ describe('store.runBulkUnassign', () => {
 
     expect(fake.batchWrites).toHaveLength(1)
     expect(fake.batchWrites[0]?.map((w) => w.characterId).sort()).toEqual(['c1', 'c2'])
-    expect(fake.batchGets).toHaveLength(1)
+    // Fully-verified operation: the batch reply already carries the committed
+    // tags, so the post-write re-read never happens.
+    expect(fake.batchGets).toEqual([])
+    // And the committed echo still landed in local state.
+    expect(store.view.characters.find((c) => c.id === 'c1')?.tags).toEqual(['Magic', 'Knight'])
+    expect(store.view.characters.find((c) => c.id === 'c2')?.tags).toEqual(['Dark'])
   })
 
   test('a partial failure is reported per character and retryable per character', async () => {
@@ -1369,7 +1403,7 @@ describe('store partial failure and retry', () => {
 // ---------------------------------------------------------------------------
 
 describe('store.refresh efficiency', () => {
-  test('a write re-reads only the affected characters, not the library', async () => {
+  test('a fully-verified write re-reads nothing and never reloads the library', async () => {
     const fake = seeded()
     const store = makeStore(fake)
     await store.load()
@@ -1379,8 +1413,9 @@ describe('store.refresh efficiency', () => {
 
     // No full reload happened.
     expect(fake.listCalls).toBe(1)
-    // Exactly the two affected ids were re-read, once.
-    expect(fake.batchGets).toEqual([['c1', 'c2']])
+    // No re-read either: every mutation resolved against the committed echo,
+    // which IS the confirmation.
+    expect(fake.batchGets).toEqual([])
 
     // And `refresh()` with no ids does nothing at all.
     const before = fake.batchGets.length
@@ -1563,18 +1598,20 @@ describe('store search help', () => {
 // ---------------------------------------------------------------------------
 
 describe('store batched write and re-read', () => {
-  test('a bulk edit costs ONE write request and ONE batched read', async () => {
+  test('a bulk edit costs ONE write request and NO batched read on full success', async () => {
     const fake = seeded()
     const store = makeStore(fake)
     await store.load()
 
     await store.actions.runDeleteTags(['Elf'])
 
-    // Four characters, two round trips: the message channel is no longer
-    // paying per character, which is what exhausted the host on large edits.
+    // Four characters touched, one round trip for the write and none for the
+    // re-read: the host's post-UPDATE rows in the batch reply are the
+    // confirmation, which is what stops the host from being paid twice on
+    // large edits.
     expect(fake.batchWrites).toHaveLength(1)
     expect(fake.batchWrites[0]?.map((u) => u.characterId).sort()).toEqual(['c1', 'c2'])
-    expect(fake.batchGets).toEqual([['c1', 'c2']])
+    expect(fake.batchGets).toEqual([])
     expect(fake.listCalls).toBe(1)
     expect(store.view.tagIndex.byKey.has('elf')).toBe(false)
   })
@@ -1613,13 +1650,16 @@ describe('store batched write and re-read', () => {
     expect(store.view.characters.find((c) => c.id === 'c3')?.name).toBe('Cass')
   })
 
-  test('a character the re-read could not fetch keeps the value already held', async () => {
+  test('a character dropped from the write reply keeps the value already held', async () => {
     const fake = seeded()
     const store = makeStore(fake)
     await store.load()
 
-    // The write lands, but the backend cannot read this one back, so it drops
-    // it from the reply — the same partial-success the real batch read has.
+    // The write lands, but the backend never mentions this character in the
+    // reply — neither as written nor as failed — so its outcome is unknowable
+    // (`unverified`) and the store falls back to the tags-only re-read, where
+    // the backend again cannot fetch this one and drops it.
+    fake.droppedFromBatchWrites.add('c1')
     fake.hiddenFromBatchReads.add('c1')
     await store.actions.runDeleteTags(['Elf'])
 
@@ -1628,6 +1668,8 @@ describe('store batched write and re-read', () => {
     // from a read that never happened. The operation report is where the failure
     // of the write itself is surfaced.
     expect(aria?.tags).toEqual(['Elf', 'Magic', 'Knight'])
+    // The uncertain outcome forced the fallback re-read, exactly as before.
+    expect(fake.batchGets).toHaveLength(1)
   })
 
   test('a failed character in a bulk edit is reported, and the others are saved', async () => {
@@ -1644,5 +1686,130 @@ describe('store batched write and re-read', () => {
     expect(store.view.characters.find((c) => c.id === 'c1')?.tags).toEqual(['Magic', 'Knight'])
     // The re-read confirms what actually landed: c2 still has the old tags.
     expect(store.view.characters.find((c) => c.id === 'c2')?.tags).toEqual(['Elf', 'Dark'])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Committed echo — the no-re-read fast path
+// ---------------------------------------------------------------------------
+
+describe('store committed echo (no re-read on full success)', () => {
+  test('a fully-verified operation never calls getTagsBatch, patches state and stamps lastRefreshedAt', async () => {
+    const fake = seeded()
+    const store = makeStore(fake)
+    await store.load()
+    const batchGetsBefore = fake.batchGets.length
+    const refreshedBefore = store.view.lastRefreshedAt
+
+    await store.actions.runBulkAssign(['Rogue'], ['c1', 'c4'])
+
+    // The batch reply already confirmed the committed tags, so the post-write
+    // re-read never happens.
+    expect(fake.batchGets.length).toBe(batchGetsBefore)
+    // Local state still ends up correct, straight from the echo.
+    expect(store.view.characters.find((c) => c.id === 'c1')?.tags).toEqual([
+      'Elf',
+      'Magic',
+      'Knight',
+      'Rogue',
+    ])
+    expect(store.view.characters.find((c) => c.id === 'c4')?.tags).toEqual(['Rogue'])
+    expect(store.view.tagIndex.byKey.get('rogue')?.count).toBe(2)
+    expect(store.view.lastRefreshedAt).not.toBeNull()
+    expect(store.view.lastRefreshedAt).toBeGreaterThanOrEqual(refreshedBefore ?? 0)
+    // Every succeeded mutation carries the tags the host confirmed.
+    const report = store.view.reports.at(-1)
+    expect(report?.status).toBe('succeeded')
+    for (const r of report?.results ?? []) {
+      expect(r.state).toBe('succeeded')
+      expect(r.committedTags).toEqual(fake.server.get(r.characterId)?.tags)
+    }
+  })
+
+  test('a single failing mutation falls back to the re-read, still exactly once', async () => {
+    const fake = seeded()
+    const store = makeStore(fake)
+    await store.load()
+
+    fake.failWrites('c2', new Error('network unreachable'), 1)
+    await store.actions.runDeleteTags(['Elf'])
+
+    // The partial failure forfeits the echo fast path for the whole operation:
+    // the re-read happens, once, exactly as before W2.2.
+    expect(fake.batchGets).toHaveLength(1)
+    expect(fake.batchGets[0]?.sort()).toEqual(['c1', 'c2'])
+
+    const report = store.view.reports.at(-1)
+    expect(report?.status).toBe('partially_completed')
+    const failed = report?.results.find((r) => r.characterId === 'c2')
+    expect(failed?.state).toBe('failed')
+    expect(failed?.committedTags).toBeUndefined()
+    // committedTags is per-mutation: the one that WAS verified keeps its echo.
+    const succeeded = report?.results.find((r) => r.characterId === 'c1')
+    expect(succeeded?.state).toBe('succeeded')
+    expect(succeeded?.committedTags).toEqual(fake.server.get('c1')?.tags)
+    // And both characters show the truth after the fallback re-read.
+    expect(store.view.characters.find((c) => c.id === 'c1')?.tags).toEqual(['Magic', 'Knight'])
+    expect(store.view.characters.find((c) => c.id === 'c2')?.tags).toEqual(['Elf', 'Dark'])
+  })
+
+  test('a retry that resolves every failure skips the re-read too', async () => {
+    const fake = seeded()
+    const store = makeStore(fake)
+    await store.load()
+
+    fake.failWrites('c2', new Error('network unreachable'), 1)
+    await store.actions.runDeleteTags(['Elf'])
+    const report = store.view.reports.at(-1)
+    expect(report?.status).toBe('partially_completed')
+    const batchGetsAfterFailure = fake.batchGets.length
+
+    const failed = report!.results.find((r) => r.state === 'failed')!
+    await store.actions.retryOne(report!.opId, failed.mutationId)
+
+    // The retried report is fully resolved against host-confirmed echoes, so
+    // the store adds NO re-read on top of the retry's own. The ONE extra
+    // batched read IS the retry's safety re-read of exactly the failed
+    // character — that is W2.3's contract (one batched getTagsBatch, never a
+    // per-character getCharacter), not a store fallback refresh. What is
+    // pinned here is that the store does not add a second, redundant one.
+    expect(fake.batchGets.length).toBe(batchGetsAfterFailure + 1)
+    expect(fake.batchGets.at(-1)).toEqual(['c2'])
+    expect(fake.server.get('c2')?.tags).toEqual(['Dark'])
+    expect(store.view.reports.at(-1)?.status).toBe('succeeded')
+    expect(store.view.characters.find((c) => c.id === 'c2')?.tags).toEqual(['Dark'])
+  })
+
+  test('an unchanged tags-only refresh leaves the view reference-equal (no slice, no index rebuild)', async () => {
+    const fake = seeded()
+    const store = makeStore(fake)
+    await store.load()
+    const charactersBefore = store.view.characters
+    const tagIndexBefore = store.view.tagIndex
+
+    // A re-read that returns byte-identical tag arrays for every id.
+    await store.refresh(['c1', 'c2'])
+
+    expect(fake.batchGets).toEqual([['c1', 'c2']])
+    expect(store.view.characters).toBe(charactersBefore)
+    expect(store.view.tagIndex).toBe(tagIndexBefore)
+  })
+
+  test('an operation that plans zero writes hits no repo and stamps nothing', async () => {
+    const fake = seeded()
+    const store = makeStore(fake)
+    await store.load()
+    const batchGetsBefore = fake.batchGets.length
+    const refreshedBefore = store.view.lastRefreshedAt
+
+    // Neither c3 nor c4 carries `Elf`, so the plan is empty.
+    await store.actions.runBulkUnassign(['Elf'], ['c3', 'c4'])
+
+    expect(fake.batchGets.length).toBe(batchGetsBefore)
+    const report = store.view.reports.at(-1)
+    expect(report?.status).toBe('succeeded')
+    expect(report?.totals.total).toBe(0)
+    expect(report?.results).toEqual([])
+    expect(store.view.lastRefreshedAt).toBe(refreshedBefore)
   })
 })

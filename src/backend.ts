@@ -2,7 +2,8 @@
  * LumiTag backend worker.
  *
  * The worker is the ONLY place that touches host character APIs. It owns:
- *  - DTO normalization (`normalizeCharacter` / `normalizeCharacterTags`)
+ *  - DTO normalization (`normalizeCharacterWire` / `normalizeCharacterTags`);
+ *    single-character replies ship only the wire projection, never the prompt body
  *  - pagination clamping (host hard-caps `characters.list` at 200/page)
  *  - error classification into `{ code, message, retryable }`
  *  - the bulk transport, which writes many characters from ONE message and
@@ -23,7 +24,7 @@
  * carries no userId.
  */
 
-import { normalizeCharacter, normalizeCharacterTags, normalizeCharacterTagsOnly } from './shared/normalize'
+import { normalizeCharacterWire, normalizeCharacterTags, normalizeCharacterTagsOnly } from './shared/normalize'
 import {
   BACKEND_ERROR_NOT_FOUND,
   BACKEND_ERROR_TIMEOUT,
@@ -143,21 +144,23 @@ function sendError(
 /**
  * The host requires an explicit `userId` on every character call when the
  * extension is installed operator-scoped, and there is nothing sensible to
- * substitute when the envelope did not carry one. Fail with a stable,
- * wire-safe code rather than calling the host with `""` (which just moves the
- * failure into the host) and rather than inventing or persisting an id.
+ * substitute when the envelope did not carry one. The host routes a
+ * frontend-message reply whose target user is unresolved to the broadcast
+ * "system" WS topic, which reaches EVERY connected client, so an error reply
+ * addressed to "" would leak this failure to users it does not belong to.
+ * Instead of sending anything, log and drop the request silently (callers
+ * return as soon as this yields null).
+ *
+ * A blank or whitespace-only envelope is as unresolvable as a missing one:
+ * the host has no honest target to compare against, so it is dropped the
+ * same way.
  *
  * User-scoped installs are unaffected: passing their own owner through is
  * exactly what the host compares against, so the scope check still passes.
  */
 function requireUserId(requestId: string, userId: string): string | null {
-  if (typeof userId === 'string' && userId.length > 0) return userId
+  if (typeof userId === 'string' && userId.trim().length > 0) return userId
   spindle.log.warn(`${ERROR_SCOPE_UNRESOLVED}: dropping request ${requestId} with no user scope`)
-  sendError(requestId, '', {
-    code: ERROR_SCOPE_UNRESOLVED,
-    message: 'No user scope on this connection; cannot read or write characters.',
-    retryable: false,
-  })
   return null
 }
 
@@ -197,7 +200,7 @@ async function handleList(payload: Record<string, unknown>, userId: string): Pro
 
   try {
     const page = await spindle.characters.list({ limit, offset, userId: scopedUserId })
-    const data = Array.isArray(page?.data) ? page.data.map(normalizeCharacter) : []
+    const data = Array.isArray(page?.data) ? page.data.map(normalizeCharacterWire) : []
     const total = typeof page?.total === 'number' && Number.isFinite(page.total) ? page.total : data.length
 
     spindle.sendToFrontend(
@@ -232,7 +235,7 @@ async function handleGet(payload: Record<string, unknown>, userId: string): Prom
       {
         type: 'characters.get.result',
         requestId,
-        character: character === null || character === undefined ? null : normalizeCharacter(character),
+        character: character === null || character === undefined ? null : normalizeCharacterWire(character),
       } satisfies BackendResponse,
       userId,
     )
@@ -278,7 +281,7 @@ async function handleUpdateTags(payload: Record<string, unknown>, userId: string
       {
         type: 'characters.updateTags.result',
         requestId,
-        character: normalizeCharacter(character),
+        character: normalizeCharacterWire(character),
       } satisfies BackendResponse,
       userId,
     )
@@ -416,9 +419,12 @@ async function handleGetBatch(payload: Record<string, unknown>, userId: string):
   }
 
   const ids: string[] = []
+  const seen = new Set<string>()
   for (const id of payload.characterIds) {
     if (typeof id !== 'string' || id.length === 0) continue
-    if (!ids.includes(id)) ids.push(id)
+    if (seen.has(id)) continue
+    seen.add(id)
+    ids.push(id)
   }
 
   const characters: { id: string; tags: string[] }[] = []
@@ -470,15 +476,18 @@ spindle.onFrontendMessage((payload: unknown, userId: string) => {
       return
     default: {
       // Malformed/unknown message: reply with an error only if we can correlate
-      // it, so the caller's timeout does not fire for a request we saw.
+      // it, so the caller's timeout does not fire for a request we saw — and
+      // only when we have a user to address the reply to. An unscoped reply
+      // would reach EVERY connected client, so it is logged and dropped.
       const requestId = recoverRequestId(payload)
-      if (requestId) {
-        sendError(requestId, userId, {
-          code: ERROR_INVALID_INPUT,
-          message: `Unsupported LumiTag request type: ${String(payload.type)}`,
-          retryable: false,
-        })
-      }
+      if (!requestId) return
+      const scopedUserId = requireUserId(requestId, userId)
+      if (!scopedUserId) return
+      sendError(requestId, scopedUserId, {
+        code: ERROR_INVALID_INPUT,
+        message: `Unsupported LumiTag request type: ${String(payload.type)}`,
+        retryable: false,
+      })
     }
   }
 })

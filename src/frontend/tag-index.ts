@@ -127,6 +127,27 @@ export function buildTagIndex(characters: readonly LumiTagCharacter[]): TagIndex
 }
 
 
+/** Element-wise equality for two string arrays (order-sensitive). */
+function sameStringArray(a: readonly string[], b: readonly string[]): boolean {
+  if (a.length !== b.length) return false
+  for (let i = 0; i < a.length; i += 1) {
+    if (a[i] !== b[i]) return false
+  }
+  return true
+}
+
+/**
+ * Whether a rebuilt tag entry is indistinguishable from the one already in the
+ * index — same spelling, same count, same member ids in the same order.
+ */
+function sameTagEntry(existing: TagEntry, rebuilt: TagEntry): boolean {
+  return (
+    existing.name === rebuilt.name &&
+    existing.count === rebuilt.count &&
+    sameStringArray(existing.characterIds, rebuilt.characterIds)
+  )
+}
+
 /**
  * Incrementally apply tag-only character refreshes to an existing index.
  *
@@ -136,6 +157,12 @@ export function buildTagIndex(characters: readonly LumiTagCharacter[]): TagIndex
  *
  * Unknown character ids are ignored, matching the store's tags-only merge
  * behavior. Duplicate ids are already collapsed in `index.byCharacterId`.
+ *
+ * If no refreshed id actually changes its tag set, the ORIGINAL index object
+ * is returned untouched — no fresh `byKey` map, `tags` array, or entry objects
+ * are minted. When only the per-character tag lists change but every rebuilt
+ * catalog entry comes out identical, the old `byKey`/`tags` references are
+ * reused inside the new index.
  */
 export function updateTagIndex(
   index: TagIndex,
@@ -143,16 +170,28 @@ export function updateTagIndex(
 ): TagIndex {
   if (updated.size === 0) return index
 
+  // Phase 1: work out each known id's next tag list and whether ANY of them
+  // differs from what the index already holds. If none does, the rebuilt
+  // catalog would be byte-identical, so hand back the original object.
+  const nextById = new Map<string, string[]>()
+  let byCharacterIdChanged = false
+  for (const [rawId, value] of updated) {
+    const id = typeof rawId === 'string' ? rawId.trim() : ''
+    if (id === '' || !index.byCharacterId.has(id)) continue
+
+    const previous = index.byCharacterId.get(id) ?? []
+    const next = dedupeTagNames(Array.isArray(value?.tags) ? value.tags : [])
+    nextById.set(id, next)
+    if (!sameStringArray(previous, next)) byCharacterIdChanged = true
+  }
+
+  if (!byCharacterIdChanged) return index
+
   const byCharacterId = new Map(index.byCharacterId)
   const affectedKeys = new Set<string>()
 
-  for (const [rawId, value] of updated) {
-    const id = typeof rawId === 'string' ? rawId.trim() : ''
-    if (id === '' || !byCharacterId.has(id)) continue
-
-    const previous = byCharacterId.get(id) ?? []
-    const next = dedupeTagNames(Array.isArray(value?.tags) ? value.tags : [])
-    for (const name of previous) affectedKeys.add(tagKey(name))
+  for (const [id, next] of nextById) {
+    for (const name of index.byCharacterId.get(id) ?? []) affectedKeys.add(tagKey(name))
     for (const name of next) affectedKeys.add(tagKey(name))
     byCharacterId.set(id, next)
   }
@@ -160,6 +199,7 @@ export function updateTagIndex(
   if (affectedKeys.size === 0) return index
 
   const byKey = new Map(index.byKey)
+  let byKeyChanged = false
   for (const key of affectedKeys) {
     let name = ''
     const characterIds: string[] = []
@@ -170,10 +210,28 @@ export function updateTagIndex(
       characterIds.push(characterId)
     }
 
+    const existing = index.byKey.get(key)
     if (characterIds.length === 0) {
+      if (existing === undefined) continue
       byKey.delete(key)
-    } else {
-      byKey.set(key, { name, key, count: characterIds.length, characterIds })
+      byKeyChanged = true
+      continue
+    }
+
+    const rebuilt: TagEntry = { name, key, count: characterIds.length, characterIds }
+    if (existing !== undefined && sameTagEntry(existing, rebuilt)) continue
+    byKey.set(key, rebuilt)
+    byKeyChanged = true
+  }
+
+  if (!byKeyChanged) {
+    // Per-character tag lists changed (e.g. a non-first spelling variant) but
+    // every catalog entry rebuilt identically: keep the derived map and array.
+    return {
+      tags: index.tags,
+      byKey: index.byKey,
+      byCharacterId,
+      characterCount: byCharacterId.size,
     }
   }
 

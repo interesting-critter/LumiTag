@@ -1,4 +1,4 @@
-import type { CharacterTags, LumiTagCharacter } from './types'
+import type { CharacterTags, LumiTagCharacterWire } from './types'
 
 /**
  * Frontend -> backend request envelope. `requestId` correlates the reply.
@@ -11,8 +11,9 @@ import type { CharacterTags, LumiTagCharacter } from './types'
  * one round trip per character and carry a full character DTO each way, which
  * is what exhausted the Termux/Android WebView host on large renames. The
  * `*Batch` requests carry many characters in one message and answer with
- * {@link CharacterTags} only; the single-character requests remain for the
- * retry path, which re-reads exactly one character on purpose.
+ * {@link CharacterTags} only; the single-character requests remain for
+ * targeted callers, while the bulk edit AND its retry path both use the
+ * batch transports exclusively.
  */
 export type BackendRequest =
   | { type: 'characters.list'; requestId: string; offset: number; limit: number }
@@ -22,10 +23,17 @@ export type BackendRequest =
   | { type: 'characters.updateTagsBatch.cancel'; requestId: string }
   | { type: 'characters.getBatch'; requestId: string; characterIds: string[] }
 
+/**
+ * The single-character replies are SLIM by design: they carry the
+ * {@link LumiTagCharacterWire} projection (`id`, `name`, `tags`, `image_id`,
+ * `created_at`, `updated_at`) and never a character's prompt body — the
+ * frontend has no use for it, so every reply would be payload for no
+ * behaviour.
+ */
 export type BackendResponse =
-  | { type: 'characters.list.result'; requestId: string; data: LumiTagCharacter[]; total: number }
-  | { type: 'characters.get.result'; requestId: string; character: LumiTagCharacter | null }
-  | { type: 'characters.updateTags.result'; requestId: string; character: LumiTagCharacter }
+  | { type: 'characters.list.result'; requestId: string; data: LumiTagCharacterWire[]; total: number }
+  | { type: 'characters.get.result'; requestId: string; character: LumiTagCharacterWire | null }
+  | { type: 'characters.updateTags.result'; requestId: string; character: LumiTagCharacterWire }
   | { type: 'characters.updateTagsBatch.result'; requestId: string; updated: CharacterTags[]; failures: BatchFailure[] }
   | { type: 'characters.getBatch.result'; requestId: string; characters: CharacterTags[] }
   | { type: 'error'; requestId: string; code: string; message: string; retryable: boolean }

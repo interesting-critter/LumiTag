@@ -67,6 +67,19 @@ export interface MutationResult {
    * server may have applied the change before the response was lost.
    */
   uncertain: boolean
+  /**
+   * Committed tags as confirmed by the host, when this mutation's write was
+   * verified against them.
+   *
+   * Present ⇔ the outcome was verified against tags the host itself reported:
+   * the batch reply's post-UPDATE row (see `verifyWrite`), or a retry's
+   * `getTagsBatch` re-read / `updateTagsBatch` reply echo. Absent on any
+   * unverified or uncertain outcome — a failed write, a host that never
+   * reported the character back, or a write the host accepted whose final
+   * tags it did not echo — because in those cases nothing vouches for the
+   * values here, and the store must re-read rather than trust a local echo.
+   */
+  committedTags?: string[]
 }
 
 /** Operation-level status shown in the UI. */

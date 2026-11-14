@@ -2,17 +2,21 @@
  * Mutation executor: turns a reviewed preview into real writes, tracks every
  * change independently, and makes retries SAFE.
  *
- * Two invariants drive the whole design:
+ * Three invariants drive the whole design:
  *
  *  1. **One write per character per attempt.** A character produces exactly ONE
  *     planned mutation carrying its complete intended final tag array, and that
  *     array — never a stale full-character snapshot — is what is sent. A write
  *     can therefore never clobber unrelated fields. The whole operation's
  *     writes travel in ONE `updateTagsBatch` call: a round trip per character
- *     is what exhausted the Termux/WebView host on a large bulk edit.
+ *     is what exhausted the Termux/WebView host on a large bulk edit. A
+ *     retry uses the same batched transports: ONE `getTagsBatch` to re-read
+ *     current tags, ONE `updateTagsBatch` for whatever still needs writing.
  *
- *  2. **Never replay a stale snapshot.** Every retry re-reads the character and
- *     recomputes the intended change against the CURRENT tags. A user edit
+ *  2. **Never replay a stale snapshot.** A retry still re-reads before it
+ *     writes — now in ONE batched `getTagsBatch` round trip for every failed
+ *     character, followed by at most ONE batched `updateTagsBatch` — and
+ *     recomputes each intended change against the CURRENT tags. A user edit
  *     made between attempts survives, and a write that actually landed before
  *     a timeout is detected instead of being applied twice.
  *
@@ -26,9 +30,8 @@
  */
 
 import type { CharacterMutationPort } from '../repository'
-import type { LumiTagCharacter } from '../../shared/types'
+import type { CharacterTags } from '../../shared/types'
 import type { BatchFailure } from '../../shared/protocol'
-import { mapWithConcurrency } from '../concurrency'
 import { dedupeTagNames, tagKey } from '../tag-index'
 import type { MutationOp, OperationPreview, PlannedMutation } from './planner'
 import {
@@ -40,7 +43,11 @@ import {
   type OperationReport,
 } from './report'
 
-/** Default number of simultaneous character writes during a retry. */
+/**
+ * @deprecated Retained for compatibility only; never consulted. A retry's write
+ * path is ONE batched `updateTagsBatch` call, so there is nothing left to fan
+ * out — and `execute()` was already one batched write.
+ */
 export const DEFAULT_WRITE_CONCURRENCY = 4
 
 /**
@@ -56,12 +63,14 @@ export const PROGRESS_EMIT_INTERVAL_MS = 50
 
 export interface ExecutorOptions {
   /**
-   * Max simultaneous character writes during a RETRY. Default 4.
+   * RETAINED FOR COMPATIBILITY — accepted and ignored.
    *
-   * `execute()` no longer consults it: a bulk edit is one batched write, so
-   * there is nothing left to fan out. Retries stay per-character on purpose —
-   * each one re-reads a single record before deciding what to write — and that
-   * is where the cap still does work.
+   * @deprecated It once capped simultaneous character writes during a retry.
+   * The retry path is now one batched `getTagsBatch` read plus one batched
+   * `updateTagsBatch` write for the whole set of failures, so there is
+   * nothing left to fan out and the value has no effect. `execute()` never
+   * consulted it either. Existing call sites keep compiling; prefer omitting
+   * it.
    */
   concurrency?: number
   /** Injectable clock for deterministic tests. */
@@ -212,6 +221,7 @@ function cloneResult(r: MutationResult): MutationResult {
     addedTags: [...r.addedTags],
     removedTags: [...r.removedTags],
     ...(r.error === undefined ? {} : { error: { ...r.error } }),
+    ...(r.committedTags === undefined ? {} : { committedTags: [...r.committedTags] }),
   }
 }
 
@@ -282,12 +292,27 @@ function copyState(target: MutationResult, source: MutationResult): void {
   target.retryable = source.retryable
   target.uncertain = source.uncertain
   target.error = source.error === undefined ? undefined : { ...source.error }
+  // The duplicate adopts the SAME attempt outcome, so it adopts the tags that
+  // attempt was verified against — no second confirmation ever happened.
+  target.committedTags = source.committedTags === undefined ? undefined : [...source.committedTags]
+}
+
+interface Deferred<T> {
+  promise: Promise<T>
+  resolve: (value: T) => void
+}
+
+function createDeferred<T>(): Deferred<T> {
+  let resolveDeferred!: (value: T) => void
+  const promise = new Promise<T>((resolvePromise) => {
+    resolveDeferred = resolvePromise
+  })
+  return { promise, resolve: resolveDeferred }
 }
 
 /** Tracks in-flight retries so a duplicate retry can never double-apply a write. */
 export class MutationExecutor {
   private readonly port: CharacterMutationPort
-  private readonly concurrency: number
   private readonly now: () => number
   /**
    * In-flight retries, keyed by mutationId. The value is the shared promise
@@ -298,11 +323,9 @@ export class MutationExecutor {
 
   constructor(port: CharacterMutationPort, options?: ExecutorOptions) {
     this.port = port
-    const limit = options?.concurrency
-    this.concurrency =
-      typeof limit === 'number' && Number.isFinite(limit) && Math.floor(limit) >= 1
-        ? Math.floor(limit)
-        : DEFAULT_WRITE_CONCURRENCY
+    // `options?.concurrency` is accepted for compatibility and deliberately
+    // ignored: the retry path is one batched read plus one batched write —
+    // there is no per-character fan-out left to cap. See ExecutorOptions.
     this.now = typeof options?.now === 'function' ? options.now : () => Date.now()
   }
 
@@ -526,9 +549,23 @@ export class MutationExecutor {
   /**
    * The safe-retry core shared by retryOne / retryGroup / retryAll.
    *
-   * Each targeted mutation is re-fetched, re-evaluated against the CURRENT
-   * record, and only then rewritten. Nothing is ever replayed from
-   * `beforeTags`.
+   * Retries are BATCHED, in three passes:
+   *
+   *  1. A synchronous pass splits the targets into ATTEMPTS ALREADY IN
+   *     FLIGHT (adopted — never written twice) and FRESH mutations, whose
+   *     attempts are bumped and which are registered in `inFlight` behind a
+   *     deferred. Registration happens before the first `await`, so a
+   *     concurrent duplicate retry can never slip in and start a second
+   *     overlapping write.
+   *  2. Adopted outcomes are copied onto this run's records.
+   *  3. Fresh mutations are folded per character against a working copy of
+   *     the tags the host JUST reported — ONE `getTagsBatch` for the whole
+   *     set — and whatever still needs to land goes out as ONE
+   *     `updateTagsBatch`, then gets verified against the host's echo.
+   *
+   * Nothing is ever replayed from `beforeTags`; every intent is recomputed
+   * from freshly read tags. A retry still re-reads before it writes — just
+   * in one batched read instead of N single-character ones.
    */
   private async runRetry(
     report: OperationReport,
@@ -566,117 +603,243 @@ export class MutationExecutor {
       else byCharacter.set(r.characterId, [id])
     }
 
-    await mapWithConcurrency([...byCharacter.entries()], this.concurrency, async ([, ids]) => {
+    // ---- Pass 1 (synchronous): adopt concurrent attempts or register fresh ones.
+    //
+    // Every fresh registration happens HERE, before the first `await`, which
+    // is what preserves exactly-once-write semantics for concurrent duplicate
+    // retries: any duplicate that lands after this point sees the entry.
+    const adopted: { id: string; promise: Promise<MutationResult> }[] = []
+    const deferreds = new Map<string, Deferred<MutationResult>>()
+    const freshByCharacter = new Map<string, MutationResult[]>()
+    for (const [characterId, ids] of byCharacter) {
       for (const id of ids) {
         const mine = index.get(id) as MutationResult
-
         // Duplicate retry: an attempt for this exact mutation is already
         // running. Starting a second one could double-apply the write, so we
         // adopt the outcome of the attempt already in flight.
         const existing = this.inFlight.get(id)
         if (existing !== undefined) {
-          const outcome = await existing
-          copyState(mine, outcome)
+          adopted.push({ id, promise: existing })
           continue
         }
+        mine.state = 'retrying'
+        mine.attempts += 1
+        mine.uncertain = false
+        const deferred = createDeferred<MutationResult>()
+        this.inFlight.set(id, deferred.promise)
+        deferreds.set(id, deferred)
+        const list = freshByCharacter.get(characterId)
+        if (list) list.push(mine)
+        else freshByCharacter.set(characterId, [mine])
+      }
+    }
 
-        const attempt = this.retryOnce(mine)
-        this.inFlight.set(id, attempt)
+    // ---- Pass 2: adopt the outcomes of the concurrent attempts. Still no
+    // network call of our own has been made.
+    for (const { id, promise } of adopted) {
+      const outcome = await promise
+      copyState(index.get(id) as MutationResult, outcome)
+    }
+
+    try {
+      // ---- Pass 3 (fresh mutations only): ONE read, then at most ONE write.
+      if (freshByCharacter.size > 0) {
+        let currentById: Map<string, CharacterTags> | null
         try {
-          copyState(mine, await attempt)
-        } finally {
-          this.inFlight.delete(id)
+          // ONE request for every character this retry touches — tags only,
+          // never a full-character DTO, never a stale snapshot replay.
+          currentById = await this.port.getTagsBatch([...freshByCharacter.keys()])
+        } catch (error) {
+          // A transport-level failure means NOTHING in this read is known to
+          // have landed, so every pending mutation of every targeted character
+          // failed with that one error — exactly as it would have when each
+          // character was re-read separately.
+          const classified = classifyError(error)
+          for (const mutations of freshByCharacter.values()) {
+            for (const mutation of mutations) this.markFailure(mutation, classified)
+          }
+          currentById = null
+        }
+
+        if (currentById !== null) {
+          // Fold each character's mutations, in order, over a working copy of
+          // the CURRENT tags. A mutation whose intent is already satisfied
+          // resolves without a write; one that can be neither applied nor
+          // safely left alone becomes a conflict; the rest write as ONE batch.
+          const folded = new Map<string, string[]>()
+          // Which mutations still NEED the write — tracked locally, never on
+          // the result, because it is not an outcome.
+          const needsWrite = new Set<string>()
+          for (const [characterId, mutations] of freshByCharacter) {
+            const current = currentById.get(characterId)
+            if (current === undefined) {
+              // Absent from the reply: no honest evidence about this
+              // character's tags exists, so nothing may be written for it.
+              for (const mutation of mutations) {
+                mutation.state = 'conflict'
+                mutation.retryable = false
+                mutation.uncertain = false
+                mutation.error = {
+                  message:
+                    'This character is no longer accessible — it may have been deleted, so nothing was changed.',
+                  code: 'not_found',
+                }
+              }
+              continue
+            }
+            let workingTags = Array.isArray(current.tags) ? [...current.tags] : []
+            for (const mutation of mutations) {
+              const planned = toPlanned(mutation)
+              // Already applied — possibly by the original write whose
+              // response was lost. Recognising this is what makes an
+              // ambiguous timeout safe.
+              if (intentSatisfied(workingTags, planned)) {
+                mutation.state = 'resolved_on_retry'
+                mutation.retryable = false
+                mutation.uncertain = false
+                mutation.error = undefined
+                // Host re-read (or the working copy already verified in this fold)
+                // vouches for these tags — committedTags reflects what this
+                // mutation's satisfied intent was actually checked against,
+                // never an assumption.
+                mutation.committedTags = [...workingTags]
+                continue
+              }
+              // Rename/merge ambiguity: neither the destination nor the
+              // source is present, so we cannot know whether the user
+              // deliberately removed the tag elsewhere. Never reintroduce a
+              // source tag that is already gone.
+              if (
+                isRenameLike(mutation.op) &&
+                typeof mutation.destTag === 'string' &&
+                mutation.destTag !== '' &&
+                !hasTag(workingTags, mutation.destTag) &&
+                !hasTag(workingTags, mutation.tag)
+              ) {
+                mutation.state = 'conflict'
+                mutation.retryable = false
+                mutation.uncertain = false
+                mutation.error = {
+                  message: `"${mutation.tag}" is already gone and "${mutation.destTag}" is missing, so this change cannot be applied automatically.`,
+                  code: 'conflict',
+                }
+                continue
+              }
+              workingTags = applyIntent(workingTags, mutation.addedTags, mutation.removedTags)
+              needsWrite.add(mutation.mutationId)
+            }
+            folded.set(characterId, workingTags)
+          }
+
+          // ONE request for every character with at least one still-outstanding
+          // mutation. Characters whose mutations all resolved in the fold are
+          // never sent. (The split may reuse the port method unchanged.)
+          const writes: { characterId: string; tags: string[] }[] = []
+          for (const [characterId, mutations] of freshByCharacter) {
+            if (!mutations.some((mutation) => needsWrite.has(mutation.mutationId))) continue
+            const tags = folded.get(characterId)
+            if (tags === undefined) continue
+            writes.push({ characterId, tags: dedupeTagNames(tags) })
+          }
+
+          if (writes.length > 0) {
+            let outcome: { tagsById: Map<string, string[]>; failures: Map<string, BatchFailure> } | null = null
+            try {
+              const response = await this.port.updateTagsBatch(writes)
+              outcome = {
+                tagsById: new Map(response.updated.map((entry) => [entry.id, entry.tags])),
+                failures: new Map(response.failures.map((failure) => [failure.characterId, failure])),
+              }
+            } catch (error) {
+              // A transport-level failure means NOTHING in this batch is known
+              // to have landed: every still-outstanding mutation of every
+              // written character failed with that one error. Mutations the
+              // fold already resolved keep their state.
+              const classified = classifyError(error)
+              for (const write of writes) {
+                for (const mutation of freshByCharacter.get(write.characterId) ?? []) {
+                  if (needsWrite.has(mutation.mutationId)) this.markFailure(mutation, classified)
+                }
+              }
+            }
+
+            if (outcome !== null) {
+              for (const write of writes) {
+                // Only the mutations that still needed this write are
+                // in play — mutations already resolved (or conflicted) in the
+                // fold keep their outcome untouched.
+                const unsatisfied = (freshByCharacter.get(write.characterId) ?? []).filter((mutation) =>
+                  needsWrite.has(mutation.mutationId),
+                )
+                if (unsatisfied.length === 0) continue
+                const failure = outcome.failures.get(write.characterId)
+                if (failure) {
+                  // A per-item failure fails ONLY this character's
+                  // outstanding mutations; siblings resolved in the fold and
+                  // sibling characters are not touched.
+                  const classified = classifyBatchFailure(failure)
+                  for (const mutation of unsatisfied) this.markFailure(mutation, classified)
+                  continue
+                }
+                const stored = outcome.tagsById.get(write.characterId)
+                if (stored === undefined) {
+                  // Absent from BOTH halves of the reply: not a success and
+                  // not a failure — no evidence at all, which is what
+                  // `uncertain` means. Retryable, so the retry button comes
+                  // back and the next attempt re-reads the ground truth.
+                  for (const mutation of unsatisfied) {
+                    mutation.state = 'failed'
+                    mutation.retryable = true
+                    mutation.uncertain = true
+                    mutation.error = {
+                      message:
+                        'The host did not report this character back, so the change cannot be confirmed as saved.',
+                      code: 'unverified',
+                    }
+                  }
+                  continue
+                }
+                for (const mutation of unsatisfied) {
+                  if (intentSatisfied(stored, toPlanned(mutation))) {
+                    mutation.state = 'resolved_on_retry'
+                    mutation.retryable = false
+                    mutation.uncertain = false
+                    mutation.error = undefined
+                    // The batch reply carries the host's own post-UPDATE row,
+                    // so a satisfied intent means the committed tags are
+                    // confirmed.
+                    mutation.committedTags = [...stored]
+                  } else {
+                    mutation.state = 'failed'
+                    mutation.retryable = true
+                    mutation.uncertain = false
+                    mutation.error = {
+                      message: 'The update was saved but the tags did not change as intended.',
+                      code: 'unverified',
+                    }
+                  }
+                }
+              }
+            }
+          }
         }
       }
-    })
+    } finally {
+      // Whatever happened above, every fresh attempt now has its outcome:
+      // resolving the deferred hands exactly that outcome to any adopting
+      // retry, and the in-flight marker goes away with it.
+      for (const [id, deferred] of deferreds) {
+        const result = index.get(id) as MutationResult
+        deferred.resolve(result)
+        this.inFlight.delete(id)
+      }
+    }
 
     working.finishedAt = this.now()
     const final = snapshot(working, false)
     working.status = final.status
     working.totals = final.totals
     return final
-  }
-
-  private async retryOnce(result: MutationResult): Promise<MutationResult> {
-    const planned = toPlanned(result)
-    result.state = 'retrying'
-    result.attempts += 1
-    result.uncertain = false
-
-    let current: LumiTagCharacter | null
-    try {
-      current = await this.port.getCharacter(result.characterId)
-    } catch (error) {
-      this.markFailure(result, classifyError(error))
-      return result
-    }
-
-    if (current === null) {
-      result.state = 'conflict'
-      result.retryable = false
-      result.uncertain = false
-      result.error = {
-        message:
-          'This character is no longer accessible — it may have been deleted, so nothing was changed.',
-        code: 'not_found',
-      }
-      return result
-    }
-
-    const currentTags = Array.isArray(current.tags) ? current.tags : []
-
-    // Already applied — possibly by the original write whose response was
-    // lost. Recognising this is what makes an ambiguous timeout safe.
-    if (intentSatisfied(currentTags, planned)) {
-      result.state = 'resolved_on_retry'
-      result.retryable = false
-      result.uncertain = false
-      result.error = undefined
-      return result
-    }
-
-    // Rename/merge ambiguity: neither the destination nor the source is
-    // present, so we cannot know whether the user deliberately removed the
-    // tag elsewhere. Never reintroduce a source tag that is already gone.
-    if (
-      isRenameLike(result.op) &&
-      typeof result.destTag === 'string' &&
-      result.destTag !== '' &&
-      !hasTag(currentTags, result.destTag) &&
-      !hasTag(currentTags, result.tag)
-    ) {
-      result.state = 'conflict'
-      result.retryable = false
-      result.uncertain = false
-      result.error = {
-        message: `"${result.tag}" is already gone and "${result.destTag}" is missing, so this change cannot be applied automatically.`,
-        code: 'conflict',
-      }
-      return result
-    }
-
-    const next = applyIntent(currentTags, result.addedTags, result.removedTags)
-    try {
-      const updated = await this.port.updateTags(result.characterId, next)
-      const post = Array.isArray(updated?.tags) ? updated.tags : next
-      if (intentSatisfied(post, planned)) {
-        result.state = 'resolved_on_retry'
-        result.retryable = false
-        result.uncertain = false
-        result.error = undefined
-      } else {
-        result.state = 'failed'
-        result.retryable = true
-        result.uncertain = false
-        result.error = {
-          message: 'The update was saved but the tags did not change as intended.',
-          code: 'unverified',
-        }
-      }
-    } catch (error) {
-      this.markFailure(result, classifyError(error))
-    }
-    return result
   }
 
   /** Confirm the returned record actually satisfies every mutation's intent. */
@@ -693,6 +856,10 @@ export class MutationExecutor {
         result.retryable = false
         result.uncertain = false
         result.error = undefined
+        // The batch reply carries the host's own post-UPDATE row, so a
+        // satisfied intent means the committed tags are confirmed — which is
+        // what lets the store patch local state without an extra re-read.
+        result.committedTags = [...postTags]
       } else {
         result.state = 'failed'
         result.retryable = true

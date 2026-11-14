@@ -14,12 +14,16 @@
  *     the filtered/visible list. A user filtering to `Elf` and then deleting
  *     `Dark` must still delete `Dark` everywhere — filtering is a view concern,
  *     never a scope concern.
- *  3. **Never report success from optimistic state.** Every write is followed
- *     by a re-read of exactly the affected characters, so a failed write
- *     leaves its chip visible instead of silently dropping it.
+ *  3. **Never report success from optimistic state.** Every write is confirmed
+ *     against the host one way or another: a fully-verified batch echoes the
+ *     committed tags (see `applyCommittedFromReport`), and anything less is
+ *     followed by a re-read of exactly the affected characters — so a failed
+ *     write leaves its chip visible instead of silently dropping it.
  *  4. **Never re-fetch the whole library after a write.** `refresh()` re-reads
  *     only the ids the executor actually touched — and only their tag arrays,
- *     merged into the records already held (see `patchCharacterTags`).
+ *     merged into the records already held (see `patchCharacterTags`). A write
+ *     whose every outcome was verified against the host's own committed echo
+ *     skips even that, because the echo IS the re-read result.
  *  5. **Every operation produces a report**, including a fully successful one,
  *     so the user always gets a result confirmation.
  */
@@ -481,6 +485,13 @@ export class TagManagerStore {
    * `load()` is the only full read. After a write we know exactly which ids the
    * executor touched, so re-reading them and rebuilding the index keeps the
    * catalog truthful without paying for the whole library.
+   *
+   * This is the FALLBACK path, not the only confirmation: when every mutation
+   * in an operation was verified against the host's own committed echo, the
+   * caller patches local state from that echo directly and never calls this
+   * (see `applyCommittedFromReport`). This path runs unchanged whenever any
+   * outcome is failed, uncertain, or missing its echo — and it is also what
+   * `actions.refresh` and friends use for an explicit re-read.
    */
   async refresh(
     affectedIds?: readonly string[],
@@ -515,6 +526,58 @@ export class TagManagerStore {
   }
 
   /**
+   * Patch local state from an operation's committed echo, with NO network read.
+   *
+   * The batch reply carries each written character's COMMITTED tags (built by
+   * the host from the post-UPDATE row), and the executor validates every
+   * mutation's intent against them before marking it `succeeded`. So when
+   * EVERY mutation in the report resolved against such an echo, re-reading
+   * the same facts via `getTagsBatch` is pure waste — one host round trip per
+   * character, each returning a full DTO plus the image lookup.
+   *
+   * Returns `true` when the report was sufficient and local state was patched
+   * (or when there is nothing to patch). Returns `false` when any result is
+   * failed, uncertain, still outstanding, or carries no echo — the caller
+   * MUST fall back to `refresh(...)`, whose behavior is unchanged.
+   *
+   * `lastRefreshedAt` is stamped on success exactly as `refresh()` would, so
+   * "when was the catalog last confirmed" stays truthful on both paths.
+   *
+   * Deliberately does NOT commit and does not touch `isRefreshing`: the
+   * caller publishes the report (the final commit of the operation) or bails
+   * out on a disposed store, so this never adds a render of its own.
+   */
+  private applyCommittedFromReport(report: OperationReport): boolean {
+    const results = report.results
+    // An operation that planned zero writes has nothing to patch — which is
+    // also why `refresh([])` never reaches the repo, so skipping it preserves
+    // today's behavior exactly (no read, no crash).
+    if (results.length === 0) return true
+
+    for (const result of results) {
+      if (result.state !== 'succeeded' && result.state !== 'resolved_on_retry') return false
+      // No echo — or a malformed one — means this mutation's tags are not
+      // vouched for by the host, and the whole operation must re-read.
+      if (!Array.isArray(result.committedTags)) return false
+    }
+
+    // All outcomes verified against the host's post-UPDATE rows: trust them.
+    // Duplicate ids collapse last-write-wins; entries for one id carry the
+    // same tags in practice (one write per character per attempt).
+    const updated = new Map<string, CharacterTags>()
+    for (const result of results) {
+      updated.set(result.characterId, {
+        id: result.characterId,
+        tags: [...(result.committedTags as string[])],
+      })
+    }
+
+    this.patchCharacterTags(updated)
+    this.state.lastRefreshedAt = Date.now()
+    return true
+  }
+
+  /**
    * Merge a tags-only read into the records already held.
    *
    * Deliberately NOT `patchCharacters`: a batch read carries `{ id, tags }`, so
@@ -528,19 +591,43 @@ export class TagManagerStore {
    * stands. An id the store has never loaded is skipped rather than appended,
    * because a tags-only payload has no body to merge into and appending one
    * would invent a nameless character.
+   *
+   * When NO updated id is found and NO tag array actually differs
+   * (element-wise strict equality — the catalog dedupes tags, so it is exact),
+   * this returns without assigning `state.characters`, without touching
+   * `updateTagIndex` and without pruning. That keeps the view — and every
+   * cache derived from it — referentially stable across a no-op re-read.
    */
   private patchCharacterTags(updated: ReadonlyMap<string, CharacterTags>): void {
     if (updated.size === 0) return
 
-    const next = this.state.characters.slice()
     const positions = new Map<string, number>()
-    for (let i = 0; i < next.length; i++) positions.set((next[i] as LumiTagCharacter).id, i)
+    for (let i = 0; i < this.state.characters.length; i++) {
+      positions.set((this.state.characters[i] as LumiTagCharacter).id, i)
+    }
 
+    let next: LumiTagCharacter[] | null = null
     for (const [id, tagsOnly] of updated) {
       const at = positions.get(id)
       if (at === undefined) continue
-      next[at] = { ...(next[at] as LumiTagCharacter), tags: [...tagsOnly.tags] }
+      const current = this.state.characters[at] as LumiTagCharacter
+      const incoming = tagsOnly.tags
+      const currentTags = current.tags
+      // Unchanged record: leave the existing object in place.
+      if (
+        Array.isArray(currentTags) &&
+        currentTags.length === incoming.length &&
+        currentTags.every((tag, i) => tag === incoming[i])
+      ) {
+        continue
+      }
+      if (next === null) next = this.state.characters.slice()
+      next[at] = { ...current, tags: [...incoming] }
     }
+
+    // No known id carried a different tag set: nothing changed, so nothing is
+    // assigned and no derived state is rebuilt. The old snapshot stands.
+    if (next === null) return
 
     this.state.characters = next
     this.state.tagIndex = updateTagIndex(this.state.tagIndex, updated)
@@ -600,21 +687,28 @@ export class TagManagerStore {
   // -------------------------------------------------------------------------
 
   /**
-   * Plan over the FULL accessible set, execute, then re-read what changed.
+   * Plan over the FULL accessible set, execute, then confirm what changed.
    *
    * This is the single write path: `run*` actions only differ in how they build
-   * their `PlanInput`. The refresh happens BEFORE the report is surfaced, so
+   * their `PlanInput`. Confirmation happens BEFORE the report is surfaced, so
    * the panel and the list can never disagree about what was saved.
+   *
+   * Confirmation is two-tiered: a fully-verified operation is patched straight
+   * from the batch reply's committed echo (`applyCommittedFromReport` — no
+   * network), while any failed, uncertain or missing outcome falls back to the
+   * tags-only re-read, exactly as before.
    */
   private async runPlan(input: PlanInput): Promise<void> {
     const preview = planOperation(this.state.characters, input)
     const report = await this.executor.execute(preview)
     // The report publication below is the final commit for this operation.
-    // Defer the successful refresh commit so we don't compute/publish the full
-    // derived view twice back-to-back after a mutation.
-    await this.refresh(report.results.map((r) => r.characterId), {
-      deferSuccessCommit: true,
-    })
+    // Either confirmation path defers its successful commit so we don't
+    // compute/publish the full derived view twice back-to-back after a mutation.
+    if (!this.applyCommittedFromReport(report)) {
+      await this.refresh(report.results.map((r) => r.characterId), {
+        deferSuccessCommit: true,
+      })
+    }
     if (this.disposed) return
     this.addReport(report, true)
   }
@@ -636,6 +730,16 @@ export class TagManagerStore {
     this.commit()
   }
 
+  /**
+   * Retry a failed report, then confirm what changed.
+   *
+   * Confirmation mirrors `runPlan`: when every result of the retried report
+   * resolved against a host-confirmed echo (a retry that found the change
+   * already applied, one whose host echo satisfied the intent, or a mutation
+   * that succeeded in the original batch), local state is patched from that
+   * echo and NO re-read happens. Any failed, uncertain or echo-less outcome
+   * falls back to the tags-only re-read, unchanged.
+   */
   private async runRetry(
     opId: string,
     pick: (report: OperationReport) => Promise<OperationReport>,
@@ -643,9 +747,11 @@ export class TagManagerStore {
     const report = this.state.reports.find((r) => r.opId === opId)
     if (!report) return
     const updated = await pick(report)
-    await this.refresh(updated.results.map((r) => r.characterId), {
-      deferSuccessCommit: true,
-    })
+    if (!this.applyCommittedFromReport(updated)) {
+      await this.refresh(updated.results.map((r) => r.characterId), {
+        deferSuccessCommit: true,
+      })
+    }
     if (this.disposed) return
     this.addReport(updated, true)
   }
@@ -831,10 +937,11 @@ export class TagManagerStore {
           return a.tags.length - b.tags.length || byName
         case 'has_tags_first':
           // More tags first; equal counts fall back to the SAME ascending name
-          // tiebreak every other mode uses. Inverting it here made `has_tags_first`
-          // the one mode whose tie order contradicted the others, so a list of
-          // equally-tagged characters came out Z-A.
-          return b.tags.length - a.tags.length ? 1 : byName
+          // tiebreak every other mode uses. Deliberately identical to `tags_desc`:
+          // the historical `b.tags.length - a.tags.length ? 1 : byName` returned
+          // 1 whenever the counts differed (whatever the sign), so the mode never
+          // actually sorted by tag count.
+          return b.tags.length - a.tags.length || byName
         case 'no_tags_first':
           return a.tags.length === 0 ? (b.tags.length === 0 ? byName : -1) : b.tags.length === 0 ? 1 : byName
         default:
@@ -1009,7 +1116,9 @@ export class TagManagerStore {
     },
 
     selectAllVisibleTags: () => {
-      // ONLY what the user can currently see — never the whole catalog.
+      // Everything matching the current search/filters, across ALL pages —
+      // `tagRows` is the full filtered/sorted list, not the page window. With
+      // no active filter this is the whole catalog.
       const visible = this.view.tagRows.map((row) => row.entry.key)
       const set = this.state.selectedTagKeys
       const before = set.size
@@ -1091,6 +1200,9 @@ export class TagManagerStore {
     },
 
     selectAllVisibleCharacters: () => {
+      // Everything matching the current search/sort/filters, across ALL pages —
+      // `characterRows` is the full filtered/sorted list, not the page window.
+      // With no active filter this is the whole library.
       const visible = this.view.characterRows.map((row) => row.character.id)
       const set = this.state.selectedCharacterIds
       const before = set.size
@@ -1359,9 +1471,9 @@ function sameSet(a: ReadonlySet<string>, b: ReadonlySet<string>): boolean {
  *
  * The result is a real `MutationResult` rather than an empty list, so the
  * failure panel renders a row with the character, the intended change and the
- * server's reason — and so `retryOne` works: `MutationExecutor.retryOnce`
- * rebuilds the intent from `removedTags`, re-reads the character and writes
- * only if the tag is still there.
+ * server's reason — and so `retryOne` works: the executor's retry rebuilds
+ * the intent from `removedTags`, re-reads the character's CURRENT tags and
+ * writes only if the tag is still there.
  *
  * `uncertain` is carried straight from `classifyError`, so a timeout that may
  * already have landed on the server is labelled as such instead of inviting a
